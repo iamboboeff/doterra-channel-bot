@@ -6,54 +6,49 @@ import * as store from './store.js';
 
 const MEMBER_TOKEN = process.env.MEMBER_BOT_TOKEN;
 const ADMIN_TOKEN = process.env.ADMIN_BOT_TOKEN;
-const CHANNEL_ID = Number(process.env.CHANNEL_ID);
-const CHAT_ID = Number(process.env.CHAT_ID);
-const THRESHOLD = Number(process.env.THRESHOLD) || 50;
-// Куда пускаем / откуда удаляем: канал и (опционально) чат-группа.
-const TARGETS = [
-  { id: CHANNEL_ID, label: '📢 Канал' },
-  { id: CHAT_ID, label: '💬 Чат' },
-].filter((t) => Number.isFinite(t.id) && t.id !== 0);
+
+// ── Чаты-тиры: TIER1_ID / TIER1_THRESHOLD / TIER1_NAME, TIER2_… и т.д. ──────
+// Тир = один чат со своим порогом баллов. id можно оставить пустым, пока чат не
+// создан (тогда бот не приглашает/не банит в него, но кнопки/расчёт работают).
+function loadTiers() {
+  const tiers = [];
+  for (let n = 1; n <= 9; n++) {
+    const name = process.env[`TIER${n}_NAME`];
+    const idNum = Number(process.env[`TIER${n}_ID`]);
+    const hasId = Number.isFinite(idNum) && idNum !== 0;
+    if (!name && !hasId) continue;
+    tiers.push({
+      key: String(n),
+      id: hasId ? idNum : null,
+      threshold: Number(process.env[`TIER${n}_THRESHOLD`]) || 50,
+      name: name || `Чат №${n}`,
+    });
+  }
+  return tiers;
+}
+const TIERS = loadTiers();
+const tierByKey = (k) => TIERS.find((t) => t.key === k);
+const tierByChat = (chatId) => TIERS.find((t) => t.id === chatId);
+
 const ADMIN_IDS = new Set(
   (process.env.ADMIN_IDS || '').split(',').map((s) => Number(s.trim())).filter(Boolean)
 );
-// Админов можно задавать и по @username (без @), через запятую — удобно, когда
-// не знаешь числовой user_id человека. Сравнение без учёта регистра.
 const ADMIN_USERNAMES = new Set(
   (process.env.ADMIN_USERNAMES || '').split(',').map((s) => s.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)
 );
 
-// ROLE управляет тем, какой(ие) бот(ы) активно опрашивает ЭТОТ процесс —
-// удобно, когда участников- и админ-бот развёрнуты как ДВЕ отдельные записи
-// на хостинге (например bothost, где 1 запись = 1 токен):
-//   ROLE=member — опрашивает только бот участников
-//   ROLE=admin  — опрашивает только админ-бот
-//   ROLE=both   — оба в одном процессе (по умолчанию, как раньше)
-// Токен «второго» бота всё равно стоит указывать в обеих записях — админ-бот
-// им уведомляет участников и шлёт им ссылки-приглашения.
+// ROLE: both | member | admin — какой бот активно опрашивает Telegram (для
+// раздельного деплоя двух записей). Токен «второго» бота всё равно указываем —
+// админ-бот шлёт участникам ссылки и уведомления через memberBot.api.
 const ROLE = (process.env.ROLE || 'both').toLowerCase();
 const wantMember = ROLE === 'member' || ROLE === 'both';
 const wantAdmin = ROLE === 'admin' || ROLE === 'both';
 
-if (!wantMember && !wantAdmin) {
-  console.error(`Неверный ROLE="${ROLE}". Допустимо: member, admin, both.`);
-  process.exit(1);
-}
-if (wantMember && !MEMBER_TOKEN) {
-  console.error(`ROLE=${ROLE} требует MEMBER_BOT_TOKEN в .env`);
-  process.exit(1);
-}
-if (wantAdmin && !ADMIN_TOKEN) {
-  console.error(`ROLE=${ROLE} требует ADMIN_BOT_TOKEN в .env`);
-  process.exit(1);
-}
-if (!TARGETS.length) {
-  console.warn('⚠️  Ни CHANNEL_ID, ни CHAT_ID не заданы — бот не сможет приглашать/удалять. Впиши CHANNEL_ID в .env.');
-}
+if (!wantMember && !wantAdmin) { console.error(`Неверный ROLE="${ROLE}". Допустимо: member, admin, both.`); process.exit(1); }
+if (wantMember && !MEMBER_TOKEN) { console.error(`ROLE=${ROLE} требует MEMBER_BOT_TOKEN в .env`); process.exit(1); }
+if (wantAdmin && !ADMIN_TOKEN) { console.error(`ROLE=${ROLE} требует ADMIN_BOT_TOKEN в .env`); process.exit(1); }
+if (!TIERS.length) console.warn('⚠️  Не настроено ни одного чата (TIER1_NAME…). Бот не сможет приглашать/удалять.');
 
-// Оба объекта создаём, если токен есть, — даже если этот процесс не «опрашивает»
-// соответствующего бота: его .api всё равно нужен (например, админ-процессу —
-// memberBot.api, чтобы слать участникам ссылки и уведомления).
 const memberBot = MEMBER_TOKEN ? new Bot(MEMBER_TOKEN) : null;
 const adminBot = ADMIN_TOKEN ? new Bot(ADMIN_TOKEN) : null;
 
@@ -62,125 +57,86 @@ const isAdmin = (u) =>
 const fmtPv = (pv) => (pv == null ? '—' : pv);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Защита от двойного нажатия «Удалить/Обновить» — применение идёт один раз.
 let applying = false;
-// Состояние пошаговых действий админа (например, ввод ID для отвязки).
 const adminState = new Map();
 
-// Вызов Telegram с обработкой лимита частоты (429) и мягкими повторами.
 async function tgRetry(fn, tries = 4) {
   for (let i = 0; i < tries; i++) {
-    try {
-      return await fn();
-    } catch (e) {
+    try { return await fn(); }
+    catch (e) {
       const ra = e?.parameters?.retry_after;
-      if (ra) { await sleep((ra + 1) * 1000); continue; }         // 429 — ждём сколько велят
-      if (i < tries - 1) { await sleep(400 * (i + 1)); continue; } // прочее — короткий бэкофф
+      if (ra) { await sleep((ra + 1) * 1000); continue; }
+      if (i < tries - 1) { await sleep(400 * (i + 1)); continue; }
       throw e;
     }
   }
 }
 
-// Приглашаем участника во все цели (канал + чат): одноразовая ссылка со сроком
-// на каждую. Возвращает true, только если реально выдали хоть одну ссылку.
-// Помечаем «приглашён» (не «в канале» — это подтвердит фактический вход).
-async function inviteToTargets(member) {
-  if (!TARGETS.length) return false;
-  if (!memberBot) {
-    console.error('MEMBER_BOT_TOKEN не задан в этом процессе — не могу пригласить.');
-    return false;
-  }
-  const expire = Math.floor(Date.now() / 1000) + 24 * 3600; // ссылка живёт сутки
-  const links = [];
-  for (const t of TARGETS) {
-    try {
-      const link = await tgRetry(() =>
-        memberBot.api.createChatInviteLink(t.id, { member_limit: 1, expire_date: expire, name: `reg ${member.doterraId}` })
-      );
-      links.push(`${t.label}: ${link.invite_link}`);
-    } catch (e) {
-      console.error('Не удалось создать ссылку для', t.label, e.message);
-    }
-  }
-  if (!links.length) return false;
-  await tgRetry(() =>
-    memberBot.api.sendMessage(member.userId, `✅ Доступ открыт! Заходи по ссылкам (одноразовые, действуют сутки):\n\n${links.join('\n')}`)
-  );
-  store.setInvited(member.doterraId, true);
-  return true;
+// Одноразовая ссылка (на сутки) в чат тира. Возвращает строку ссылки или null.
+async function inviteLink(member, tier) {
+  if (!memberBot || !tier.id) return null;
+  const expire = Math.floor(Date.now() / 1000) + 24 * 3600;
+  try {
+    const link = await tgRetry(() =>
+      memberBot.api.createChatInviteLink(tier.id, { member_limit: 1, expire_date: expire, name: `reg ${member.doterraId} t${tier.key}` })
+    );
+    return link.invite_link;
+  } catch (e) { console.error('Ссылка для', tier.name, e.message); return null; }
 }
 
-// Приглашаем всех, кто набрал баллы, но ещё не внутри и ещё не приглашён.
-async function reinviteQualified(pointsMap) {
-  let invited = 0;
-  for (const m of store.listMembers()) {
-    if (m.inChannel || m.invited) continue; // уже внутри или уже с активной ссылкой
-    const pv = pointsMap.get(m.doterraId);
-    if (pv != null && pv >= THRESHOLD) {
-      try {
-        if (await inviteToTargets(m)) { invited++; await sleep(300); }
-      } catch (e) {
-        console.error('Не удалось пригласить', m.doterraId, e.message);
-      }
-    }
-  }
-  return invited;
+// Кик из конкретного чата: бан + сразу разбан (чтобы не копился ЧС).
+async function banFromTier(userId, tier) {
+  if (!adminBot || !tier.id) return { banned: false };
+  let banned = false;
+  try { await tgRetry(() => adminBot.api.banChatMember(tier.id, userId)); banned = true; }
+  catch (e) { console.error('Бан', tier.name, userId, e.message); }
+  try { await tgRetry(() => adminBot.api.unbanChatMember(tier.id, userId, { only_if_banned: true })); }
+  catch (e) { console.error('Разбан', tier.name, userId, e.message); }
+  return { banned };
 }
 
-// Кик из всех целей: бан выкидывает, разбан ТУТ ЖЕ (с повторами) снимает из ЧС.
-async function banEverywhere(userId) {
-  if (!adminBot) {
-    console.error('ADMIN_BOT_TOKEN не задан в этом процессе — не могу забанить.');
-    return { banned: false, unbanFail: false };
+async function kickFromAllTiers(member) {
+  for (const t of TIERS) {
+    if (member.tiers?.[t.key] && t.id) await banFromTier(member.userId, t);
   }
-  let banned = false, unbanFail = false;
-  for (const t of TARGETS) {
-    try {
-      await tgRetry(() => adminBot.api.banChatMember(t.id, userId));
-      banned = true;
-    } catch (e) {
-      console.error('Не удалось забанить в', t.label, userId, e.message);
-    }
-    // Разбан ОБЯЗАТЕЛЬНО и с повторами — иначе человек застрянет в чёрном списке.
-    try {
-      await tgRetry(() => adminBot.api.unbanChatMember(t.id, userId, { only_if_banned: true }));
-    } catch (e) {
-      console.error('Не удалось разбанить в', t.label, userId, e.message);
-      unbanFail = true;
-    }
-  }
-  return { banned, unbanFail };
 }
 
-// Оцениваем участника по последнему снимку баллов и реагируем.
-async function evaluateAndReply(ctx, member) {
+// По текущим баллам приглашаем участника во все чаты, где он проходит порог и
+// ещё не состоит. Возвращает { links, inNow, lack, soon }.
+async function admit(member) {
   const pv = store.getPoints(member.doterraId);
-  if (pv == null) {
+  const res = { pv, links: [], inNow: [], lack: [], soon: [] };
+  if (pv == null) return res;
+  for (const t of TIERS) {
+    const fresh = store.getMember(member.doterraId) || member;
+    const state = fresh.tiers?.[t.key];
+    if (pv >= t.threshold) {
+      if (state === 'in') { res.inNow.push(t.name); continue; }
+      const link = await inviteLink(fresh, t);
+      if (link) { res.links.push(`${t.name}: ${link}`); store.setTierState(fresh.doterraId, t.key, 'invited'); }
+      else res.soon.push(t.name); // чат ещё не подключён
+    } else {
+      res.lack.push(`${t.name} — нужно ${t.threshold}`);
+    }
+  }
+  return res;
+}
+
+async function evaluateAndReply(ctx, member) {
+  const r = await admit(member);
+  if (r.pv == null) {
     await ctx.reply(
       `ID *${member.doterraId}* принят ✅\nБаллы появятся после ближайшего обновления базы — я напишу, как откроется доступ.`,
       { parse_mode: 'Markdown' }
     );
     return;
   }
-  if (pv < THRESHOLD) {
-    await ctx.reply(
-      `Принято. Сейчас у тебя *${pv}* балл(ов), нужно *${THRESHOLD}*.\nНабери баллы и нажми /check.`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
-  }
-  if (member.inChannel) {
-    await ctx.reply(`Ты уже в канале ✅ (баллы: ${pv}).`);
-    return;
-  }
-  const ok = await inviteToTargets(member);
-  if (!ok) {
-    await ctx.reply(
-      `У тебя *${pv}* балл(ов) — доступ положен ✅, но выдать ссылку сейчас не вышло. ` +
-        `Нажми /check ещё раз чуть позже или напиши администратору.`,
-      { parse_mode: 'Markdown' }
-    );
-  }
+  let msg = '';
+  if (r.links.length) msg += `✅ Доступ открыт! Заходи (ссылки одноразовые, действуют сутки):\n\n${r.links.join('\n')}\n\n`;
+  if (r.inNow.length) msg += `Ты уже в: ${r.inNow.join(', ')}.\n`;
+  if (r.soon.length) msg += `Доступ положен, но ${r.soon.join(', ')} ещё настраивается — нажми /check позже.\n`;
+  if (r.lack.length) msg += `Пока не хватает баллов (у тебя ${r.pv}): ${r.lack.join('; ')}.\n`;
+  await ctx.reply((msg || `Баллов: ${r.pv}. Доступных чатов сейчас нет.`).trim());
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -191,26 +147,16 @@ memberBot.command('start', async (ctx) => {
   const existing = store.findMemberByUser(ctx.from.id);
   if (existing) {
     const pv = store.getPoints(existing.doterraId);
-    await ctx.reply(
-      `Ты уже зарегистрирован.\nID: ${existing.doterraId}\nБаллы: ${fmtPv(pv)}\n\n` +
-        `Нажми /check, чтобы проверить доступ заново, или пришли другой ID, если ошибся.`
-    );
+    await ctx.reply(`Ты уже зарегистрирован.\nID: ${existing.doterraId}\nБаллы: ${fmtPv(pv)}\n\nНажми /check для проверки доступа, или пришли другой ID, если ошибся.`);
     return;
   }
   store.setFlow(ctx.from.id, 'awaiting_id');
-  await ctx.reply(
-    `Привет! 👋\nЧтобы попасть в канал, пришли свой *ID участника doTERRA* — это номер из кабинета (обычно 7–8 цифр).\nНапример: 18170008`,
-    { parse_mode: 'Markdown' }
-  );
+  await ctx.reply(`Привет! 👋\nПришли свой *ID участника doTERRA* (номер из кабинета, обычно 7–8 цифр).\nНапример: 18170008`, { parse_mode: 'Markdown' });
 });
 
 memberBot.command('check', async (ctx) => {
   const member = store.findMemberByUser(ctx.from.id);
-  if (!member) {
-    store.setFlow(ctx.from.id, 'awaiting_id');
-    await ctx.reply('Ты ещё не зарегистрирован. Пришли свой ID doTERRA (7–8 цифр).');
-    return;
-  }
+  if (!member) { store.setFlow(ctx.from.id, 'awaiting_id'); await ctx.reply('Ты ещё не зарегистрирован. Пришли свой ID doTERRA (7–8 цифр).'); return; }
   await evaluateAndReply(ctx, member);
 });
 
@@ -218,48 +164,32 @@ memberBot.command('whoami', (ctx) => ctx.reply(`Твой user_id: ${ctx.from.id}
 
 memberBot.on('message:text', async (ctx) => {
   const text = ctx.message.text.trim();
-
-  // Любой корректный ID (6–9 цифр) = регистрация ИЛИ исправление прежней.
   if (/^\d{6,9}$/.test(text)) {
-    // Защита от дублей: один doTERRA ID = один Telegram-аккаунт.
-    // Если ID уже привязан к ДРУГОМУ аккаунту — отказ (чужой ID не угонишь).
     const owner = store.getMember(text);
     if (owner && owner.userId !== ctx.from.id) {
-      await ctx.reply(
-        `⛔️ ID *${text}* уже привязан к другому Telegram-аккаунту.\n` +
-          `Если это ваш ID и вышла ошибка — напишите администратору, он переназначит.`,
-        { parse_mode: 'Markdown' }
-      );
+      await ctx.reply(`⛔️ ID *${text}* уже привязан к другому Telegram-аккаунту.\nЕсли это ваш ID — напишите администратору.`, { parse_mode: 'Markdown' });
       return;
     }
     const member = store.registerMember(text, ctx.from);
     await evaluateAndReply(ctx, member);
     return;
   }
-
   const flow = store.getFlow(ctx.from.id);
-  if (flow?.step === 'awaiting_id') {
-    await ctx.reply('Пришли только цифры ID (обычно 7–8 цифр), например 18170008.');
-    return;
-  }
+  if (flow?.step === 'awaiting_id') { await ctx.reply('Пришли только цифры ID (обычно 7–8 цифр), например 18170008.'); return; }
   const member = store.findMemberByUser(ctx.from.id);
-  await ctx.reply(
-    member
-      ? 'Пришли ID (7–8 цифр), если хочешь исправить, или нажми /check для проверки доступа.'
-      : 'Напиши /start, чтобы зарегистрироваться.'
-  );
+  await ctx.reply(member ? 'Пришли ID (7–8 цифр), если хочешь исправить, или нажми /check.' : 'Напиши /start, чтобы зарегистрироваться.');
 });
 
-// Реальное вступление/выход в канале/чате → это и есть источник правды inChannel.
+// Фактический вход/выход в чате тира → источник правды членства.
 memberBot.on('chat_member', (ctx) => {
-  const upd = ctx.chatMember;
-  if (!TARGETS.some((t) => t.id === ctx.chat?.id)) return;
-  const uid = upd.new_chat_member?.user?.id;
-  const status = upd.new_chat_member?.status;
+  const t = tierByChat(ctx.chat?.id);
+  if (!t) return;
+  const uid = ctx.chatMember.new_chat_member?.user?.id;
+  const status = ctx.chatMember.new_chat_member?.status;
   const member = uid && store.findMemberByUser(uid);
   if (!member) return;
   const inside = status === 'member' || status === 'administrator' || status === 'creator';
-  store.setInChannel(member.doterraId, inside);
+  store.setTierState(member.doterraId, t.key, inside ? 'in' : null);
 });
 } // if (memberBot)
 
@@ -285,86 +215,53 @@ adminBot.use(async (ctx, next) => {
 });
 
 adminBot.command('whoami', (ctx) => ctx.reply(`Твой user_id: ${ctx.from.id}`));
-adminBot.command('chanhelp', (ctx) =>
-  ctx.reply(
-    'Чтобы узнать ID канала: добавь этого бота админом в канал, перешли сюда любой пост из канала боту @getidsbot — ' +
-      'он покажет ID вида -100…, впиши его в .env как CHANNEL_ID.'
-  )
-);
-adminBot.command('start', (ctx) =>
-  ctx.reply('Админ-панель канала doTERRA. Выбери действие ниже.\nЕщё есть команды — /help.', { reply_markup: mainMenu() })
-);
-
+adminBot.command('start', (ctx) => ctx.reply('Админ-панель doTERRA. Выбери действие ниже.\nЕщё команды — /help.', { reply_markup: mainMenu() }));
 adminBot.command('help', (ctx) =>
-  ctx.reply(
-    'Команды админа:\n' +
-      '• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой Telegram-аккаунт\n' +
-      '• /unbind <ID> — снять привязку ID (освободить)\n' +
-      '• /whoami — показать твой user_id\n\n' +
-      'Обновление подписчиков и списки — через меню /start.\n' +
-      'user_id нужного аккаунта: пусть человек напишет боту-участников /whoami.'
-  )
+  ctx.reply('Команды админа:\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой Telegram-аккаунт\n• /unbind <ID> — снять привязку ID (и выгнать из чатов)\n• /whoami — твой user_id\n\nОбновление подписчиков и списки — через меню /start.')
 );
 
-// Перепривязать ID на другой Telegram-аккаунт (со снятием старого доступа).
 adminBot.command('rebind', async (ctx) => {
-  const parts = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
-  const [doterraId, newUid] = parts;
+  const [doterraId, newUid] = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
   if (!/^\d{6,9}$/.test(doterraId || '') || !/^\d{5,}$/.test(newUid || '')) {
-    return ctx.reply(
-      'Перепривязать ID на другой аккаунт:\n/rebind <doTERRA ID> <новый user_id>\n\n' +
-        'Например: /rebind 18170008 123456789\n' +
-        'Новый user_id: пусть человек напишет боту-участников /whoami и пришлёт число.'
-    );
+    return ctx.reply('Перепривязать:\n/rebind <doTERRA ID> <новый user_id>\nНапример: /rebind 18170008 123456789\nНовый user_id: пусть человек напишет боту-участников /whoami.');
   }
   const member = store.getMember(doterraId);
-  if (!member) {
-    return ctx.reply(`ID ${doterraId} ещё никем не занят — привязывать нечего. Пусть человек просто зарегистрируется у бота-участников.`);
-  }
+  if (!member) return ctx.reply(`ID ${doterraId} ещё никем не занят — привязывать нечего.`);
   const newUidNum = Number(newUid);
   const conflict = store.findMemberByUser(newUidNum);
-  if (conflict && conflict.doterraId !== doterraId) {
-    return ctx.reply(`У аккаунта ${newUid} уже привязан ID ${conflict.doterraId}. Сначала: /unbind ${conflict.doterraId}`);
-  }
-  const oldUid = member.userId;
-  if (oldUid && oldUid !== newUidNum) {
-    try { await banEverywhere(oldUid); } catch (e) { console.error('rebind old kick', e.message); }
-  }
+  if (conflict && conflict.doterraId !== doterraId) return ctx.reply(`У аккаунта ${newUid} уже привязан ID ${conflict.doterraId}. Сначала /unbind ${conflict.doterraId}`);
+  if (member.userId && member.userId !== newUidNum) await kickFromAllTiers(member);
   store.rebindMember(doterraId, newUidNum);
-  await ctx.reply(`✅ ID ${doterraId} перепривязан на аккаунт ${newUid}. Прежний доступ отозван.`);
-
-  const pv = store.getPoints(doterraId);
-  if (pv != null && pv >= THRESHOLD) {
-    try {
-      const ok = await inviteToTargets(store.getMember(doterraId));
-      await ctx.reply(ok ? 'Новому аккаунту отправлены ссылки в канал/чат.' : 'Ссылку отправить не вышло — пусть новый аккаунт напишет боту-участников /check.');
-    } catch {
-      await ctx.reply('Ссылку отправить не вышло — пусть новый аккаунт напишет боту-участников /check.');
-    }
-  } else {
-    await ctx.reply(`Пока баллов < ${THRESHOLD} — доступ откроется, как только наберёт.`);
-  }
+  await ctx.reply(`✅ ID ${doterraId} перепривязан на аккаунт ${newUid}. Прежний доступ отозван. Пусть новый аккаунт напишет боту-участников /check.`);
 });
 
-// Снять привязку ID (освободить) + отозвать старый доступ.
 adminBot.command('unbind', async (ctx) => {
   const id = (ctx.match || '').trim();
-  if (!/^\d{6,9}$/.test(id)) return ctx.reply('Освободить ID:\n/unbind <doTERRA ID>\nНапример: /unbind 18170008');
+  if (!/^\d{6,9}$/.test(id)) return ctx.reply('Освободить ID:\n/unbind <doTERRA ID>');
   const member = store.getMember(id);
   if (!member) return ctx.reply(`ID ${id} не привязан.`);
-  if (member.userId) {
-    try { await banEverywhere(member.userId); } catch (e) { console.error('unbind kick', e.message); }
-  }
+  await kickFromAllTiers(member);
   store.unbindMember(id);
-  await ctx.reply(`✅ ID ${id} освобождён, старый доступ отозван. Теперь на него может зарегистрироваться другой человек.`);
+  await ctx.reply(`✅ ID ${id} освобождён, доступ во все чаты отозван.`);
 });
 
+// «Обновить подписчиков» → выбор чата (тира)
 adminBot.callbackQuery('adm_update', async (ctx) => {
-  store.startImport(ctx.from.id);
   await ctx.answerCallbackQuery();
+  if (!TIERS.length) return ctx.reply('Чаты не настроены (TIER1_NAME… в .env).', { reply_markup: mainMenu() });
+  const kb = new InlineKeyboard();
+  TIERS.forEach((t) => kb.text(`${t.name} (от ${t.threshold})`, `adm_tier:${t.key}`).row());
+  kb.text('❌ Отмена', 'adm_cancel');
+  await ctx.reply('Какой чат обновляем? У каждого свой порог баллов.', { reply_markup: kb });
+});
+
+adminBot.callbackQuery(/^adm_tier:(\w+)$/, async (ctx) => {
+  const tier = tierByKey(ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  if (!tier) return ctx.reply('Чат не найден.', { reply_markup: mainMenu() });
+  store.startImport(ctx.from.id, tier.key);
   await ctx.reply(
-    '📥 Пришли CSV-файл, снятый расширением «👥 doTERRA → бот».\n' +
-      'Если кабинета два — пришли оба файла по очереди, потом жми «Посчитать».',
+    `Обновляем «${tier.name}» (порог ${tier.threshold}).\n📥 Пришли CSV из расширения. Если кабинета два — оба по очереди, потом «Посчитать».`,
     { reply_markup: new InlineKeyboard().text('✅ Посчитать на вылет', 'adm_calc').text('❌ Отмена', 'adm_cancel') }
   );
 });
@@ -375,11 +272,12 @@ adminBot.callbackQuery('adm_list', async (ctx) => {
   if (!members.length) return ctx.reply('Пока никто не зарегистрирован.');
   const lines = members.map((m) => {
     const pv = store.getPoints(m.doterraId);
-    const mark = m.inChannel ? '🟢' : m.invited ? '🟡' : '⚪️';
-    return `${mark} ${m.name || '—'} · ${m.doterraId} · ${fmtPv(pv)}`;
+    const inT = TIERS.filter((t) => m.tiers?.[t.key] === 'in').map((t) => t.key);
+    const invT = TIERS.filter((t) => m.tiers?.[t.key] === 'invited').map((t) => t.key);
+    const badge = inT.length ? `🟢${inT.join(',')}` : invT.length ? `🟡${invT.join(',')}` : '⚪️';
+    return `${badge} ${m.name || '—'} · ${m.doterraId} · ${fmtPv(pv)}`;
   });
-  // Telegram-сообщение ограничено ~4096 символами — режем длинный список.
-  const head = `Участники (${members.length}) — 🟢 в канале, 🟡 приглашён, ⚪️ ждёт баллов:\n`;
+  const head = `Участники (${members.length}) — 🟢N в чате N, 🟡N приглашён, ⚪️ ждёт:\n`;
   let body = lines.join('\n');
   if ((head + body).length > 3800) body = lines.slice(0, 60).join('\n') + `\n… и ещё ${members.length - 60}`;
   await ctx.reply(head + body);
@@ -387,236 +285,170 @@ adminBot.callbackQuery('adm_list', async (ctx) => {
 
 adminBot.callbackQuery('adm_status', async (ctx) => {
   const members = store.listMembers();
-  const inCh = members.filter((m) => m.inChannel).length;
-  const inv = members.filter((m) => m.invited && !m.inChannel).length;
   await ctx.answerCallbackQuery();
+  const perTier = TIERS.map((t) => `• ${t.name} (от ${t.threshold}): ${members.filter((m) => m.tiers?.[t.key] === 'in').length} в чате`).join('\n');
   await ctx.reply(
-    `Зарегистрировано: ${members.length}\nВ канале: ${inCh}\nПриглашены (ждут входа): ${inv}\n` +
-      `Порог: ${THRESHOLD}\nСнимок баллов: ${Object.keys(store.getData().points).length} записей.\n` +
-      `Каналов/чатов под управлением: ${TARGETS.length}`
+    `Зарегистрировано: ${members.length}\n${perTier || '(чаты не настроены)'}\n` +
+      `Снимок баллов: ${Object.keys(store.getData().points).length} записей.`
   );
 });
 
 adminBot.callbackQuery('adm_cancel', async (ctx) => {
   store.clearImport();
   await ctx.answerCallbackQuery('Отменено');
-  await ctx.reply('Импорт отменён.', { reply_markup: mainMenu() });
+  await ctx.reply('Отменено.', { reply_markup: mainMenu() });
 });
 
-// ── Просмотр и отвязка привязки участника (кнопкой) ──
+// ── Отвязка участника кнопкой ──
 adminBot.callbackQuery('adm_unbind_start', async (ctx) => {
   adminState.set(ctx.from.id, { step: 'await_unbind_id' });
   await ctx.answerCallbackQuery();
-  await ctx.reply('Введите ID doTERRA участника (номер из кабинета):', {
-    reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back'),
-  });
+  await ctx.reply('Введите ID doTERRA участника:', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') });
 });
-
 adminBot.callbackQuery('adm_back', async (ctx) => {
   adminState.delete(ctx.from.id);
   await ctx.answerCallbackQuery();
   await ctx.reply('Меню:', { reply_markup: mainMenu() });
 });
-
-adminBot.callbackQuery(/^adm_unbind:(\d{6,9})$/, async (ctx) => {
+adminBot.callbackQuery(/^adm_do_unbind:(\d{6,9})$/, async (ctx) => {
   const id = ctx.match[1];
   await ctx.answerCallbackQuery();
   const m = store.getMember(id);
   if (!m) return ctx.reply('Уже отвязан или не найден.', { reply_markup: mainMenu() });
-  if (m.userId) {
-    try { await banEverywhere(m.userId); } catch (e) { console.error('unbind kick', e.message); }
-  }
+  await kickFromAllTiers(m);
   store.unbindMember(id);
-  await ctx.reply(
-    `✅ Аккаунт отвязан от ID ${id}, доступ отозван.\nТеперь на этот ID может зарегистрироваться другой человек.`,
-    { reply_markup: mainMenu() }
-  );
+  await ctx.reply(`✅ Аккаунт отвязан от ID ${id}, доступ во все чаты отозван.`, { reply_markup: mainMenu() });
 });
 
-// Ввод ID doTERRA для просмотра/отвязки (когда админ в этом шаге).
 adminBot.on('message:text', async (ctx) => {
   const st = adminState.get(ctx.from.id);
   if (st?.step !== 'await_unbind_id') return;
   const id = ctx.message.text.trim();
-  if (!/^\d{6,9}$/.test(id)) {
-    await ctx.reply('Нужен номер ID (6–9 цифр). Или нажмите «Назад».', {
-      reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back'),
-    });
-    return;
-  }
+  if (!/^\d{6,9}$/.test(id)) { await ctx.reply('Нужен номер ID (6–9 цифр). Или «Назад».', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') }); return; }
   adminState.delete(ctx.from.id);
   const m = store.getMember(id);
-  if (!m) {
-    await ctx.reply(`ID ${id} ни к кому не привязан.`, { reply_markup: mainMenu() });
-    return;
-  }
+  if (!m) { await ctx.reply(`ID ${id} ни к кому не привязан.`, { reply_markup: mainMenu() }); return; }
   const tg = m.username ? '@' + m.username : '(без username)';
-  const status = m.inChannel ? '🟢 в канале' : m.invited ? '🟡 приглашён' : '⚪️ ждёт баллов';
+  const inT = TIERS.filter((t) => m.tiers?.[t.key] === 'in').map((t) => t.name).join(', ') || '—';
   const pv = store.getPoints(id);
   await ctx.reply(
-    `🔗 Привязка ID ${id}\n` +
-      `Имя: ${m.name || '—'}\n` +
-      `Telegram: ${tg}\n` +
-      `user_id: ${m.userId}\n` +
-      `Баллы: ${pv == null ? '—' : pv}\n` +
-      `Статус: ${status}`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text('◀️ Назад', 'adm_back')
-        .text('🔓 Отвязать аккаунт от ID', `adm_unbind:${id}`),
-    }
+    `🔗 Привязка ID ${id}\nИмя: ${m.name || '—'}\nTelegram: ${tg}\nuser_id: ${m.userId}\nБаллы: ${fmtPv(pv)}\nВ чатах: ${inT}`,
+    { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back').text('🔓 Отвязать', `adm_do_unbind:${id}`) }
   );
 });
 
-// Приём CSV-файла от админа
+// Приём CSV
 adminBot.on('message:document', async (ctx) => {
   const session = store.getImport();
-  if (!session) {
-    await ctx.reply('Сначала нажми «📥 Обновить подписчиков».', { reply_markup: mainMenu() });
-    return;
-  }
+  if (!session || !session.tier) { await ctx.reply('Сначала «📥 Обновить подписчиков» и выбери чат.', { reply_markup: mainMenu() }); return; }
+  const tier = tierByKey(session.tier);
   try {
     const file = await ctx.getFile();
-    const url = `https://api.telegram.org/file/bot${ADMIN_TOKEN}/${file.file_path}`;
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('не удалось скачать файл (HTTP ' + resp.status + ')');
+    const resp = await fetch(`https://api.telegram.org/file/bot${ADMIN_TOKEN}/${file.file_path}`);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
     if (Number(resp.headers.get('content-length') || 0) > 5_000_000) throw new Error('файл слишком большой');
-    const text = await resp.text();
-    const rows = parseCSV(text);
+    const rows = parseCSV(await resp.text());
     const det = detectColumns(rows);
-    if (det.idIdx < 0 || det.pointsIdx < 0) {
-      await ctx.reply('Не нашёл колонки ID и PV. Это точно файл от расширения «doTERRA → бот»?');
-      return;
-    }
-    const records = extractRecords(rows, det.idIdx, det.pointsIdx);
-    const added = store.addImportFile(ctx.message.document.file_name || 'csv', records);
-
+    if (det.idIdx < 0 || det.pointsIdx < 0) { await ctx.reply('Не нашёл колонки ID и PV. Это файл от расширения?'); return; }
+    const added = store.addImportFile(ctx.message.document.file_name || 'csv', extractRecords(rows, det.idIdx, det.pointsIdx));
     const sess = store.getImport();
-    const inChannel = store.listMembers().filter((m) => m.inChannel);
-    const missing = inChannel.filter((m) => !(m.doterraId in sess.points));
-    const warn =
-      missing.length > 0
-        ? `\n⚠️ ${missing.length} из ${inChannel.length} в канале нет в файле — возможно, второй кабинет. ` +
-          `Пришли второй файл или жми «Посчитать» (их не тронем).`
-        : '';
-
-    await ctx.reply(`Файл принят: ${added} строк (всего файлов: ${sess.files.length}).${warn}`, {
+    const inTier = store.listMembers().filter((m) => m.tiers?.[session.tier] === 'in');
+    const missing = inTier.filter((m) => !(m.doterraId in sess.points));
+    const warn = missing.length ? `\n⚠️ ${missing.length} из ${inTier.length} в чате нет в файле (возможно, второй кабинет). Пришли второй файл или жми «Посчитать» — их не тронем.` : '';
+    await ctx.reply(`«${tier?.name}»: файл принят, ${added} строк (файлов: ${sess.files.length}).${warn}`, {
       reply_markup: new InlineKeyboard().text('✅ Посчитать на вылет', 'adm_calc').text('❌ Отмена', 'adm_cancel'),
     });
-  } catch (e) {
-    await ctx.reply('Ошибка чтения файла: ' + e.message);
-  }
+  } catch (e) { await ctx.reply('Ошибка чтения файла: ' + e.message); }
 });
 
-// «Посчитать» — показываем список И ЗАМОРАЖИВАЕМ его: подтверждение применит
-// именно этот список, ничего нового в момент бана не добавится.
 adminBot.callbackQuery('adm_calc', async (ctx) => {
   const session = store.getImport();
   await ctx.answerCallbackQuery();
-  if (!session || !session.files.length) return ctx.reply('Сначала пришли хотя бы один CSV-файл.');
-
+  const tier = tierByKey(session?.tier);
+  if (!session || !session.files.length || !tier) return ctx.reply('Сначала выбери чат и пришли CSV.');
   const pointsMap = new Map(Object.entries(session.points));
-  const inChannel = store.listMembers().filter((m) => m.inChannel);
-  const { toRemove, missing } = classify(inChannel, pointsMap, THRESHOLD);
+  const inTier = store.listMembers().filter((m) => m.tiers?.[session.tier] === 'in');
+  const { toRemove, missing } = classify(inTier, pointsMap, tier.threshold);
   store.setReviewed(toRemove.map((m) => ({ doterraId: m.doterraId, userId: m.userId, pv: m.pv })));
 
   if (!toRemove.length) {
     await ctx.reply(
-      `Никого удалять не нужно — все в канале набрали ${THRESHOLD}+.` +
-        (missing.length ? `\n(${missing.length} без данных — не тронуты.)` : ''),
+      `«${tier.name}»: удалять некого — все набрали ${tier.threshold}+.` + (missing.length ? `\n(${missing.length} без данных — не тронуты.)` : ''),
       { reply_markup: new InlineKeyboard().text('✅ Обновить баллы (без удаления)', 'adm_commit').text('❌ Отмена', 'adm_cancel') }
     );
     return;
   }
-
-  const list = toRemove.map((m, i) => `${i + 1}. ${m.name || '—'} · ${m.doterraId} · ${m.pv} балл.`).join('\n');
-  const text =
-    `❌ НА ВЫЛЕТ (PV < ${THRESHOLD}) — ${toRemove.length}:\n${list}` +
-    (missing.length ? `\n\n⚠️ Без данных (не тронем): ${missing.length}` : '') +
-    `\n\nПодтвердить удаление?`;
-  const trimmed = text.length > 3800 ? text.slice(0, 3800) + '\n… (список длинный)' : text;
-  await ctx.reply(trimmed, {
+  const list = toRemove.map((m, i) => `${i + 1}. ${m.name || '—'} · ${m.doterraId} · ${m.pv}`).join('\n');
+  const text = `❌ ИЗ «${tier.name}» НА ВЫЛЕТ (PV < ${tier.threshold}) — ${toRemove.length}:\n${list}` + (missing.length ? `\n\n⚠️ Без данных (не тронем): ${missing.length}` : '') + `\n\nПодтвердить удаление?`;
+  await ctx.reply(text.length > 3800 ? text.slice(0, 3800) + '\n… (длинный список)' : text, {
     reply_markup: new InlineKeyboard().text(`🗑 Удалить ${toRemove.length}`, 'adm_confirm').text('❌ Отмена', 'adm_cancel'),
   });
 });
 
-// Обновить баллы БЕЗ удаления (ветка «никого удалять не нужно»).
+// Приглашаем в тир всех, кто набрал его порог и ещё не в нём/не приглашён.
+async function reinviteTier(pointsMap, tier) {
+  let invited = 0;
+  for (const m of store.listMembers()) {
+    if (m.tiers?.[tier.key]) continue; // уже in или invited
+    const pv = pointsMap.get(m.doterraId);
+    if (pv != null && pv >= tier.threshold && tier.id) {
+      const link = await inviteLink(m, tier);
+      if (link) {
+        store.setTierState(m.doterraId, tier.key, 'invited');
+        if (memberBot) { try { await memberBot.api.sendMessage(m.userId, `Ты набрал баллы — доступ в «${tier.name}»:\n${link}`); } catch {} }
+        invited++; await sleep(300);
+      }
+    }
+  }
+  return invited;
+}
+
 adminBot.callbackQuery('adm_commit', async (ctx) => {
   const session = store.getImport();
-  if (!session || !session.files.length) {
-    await ctx.answerCallbackQuery('Нет загруженных файлов.');
-    return ctx.reply('Нет активного импорта.', { reply_markup: mainMenu() });
-  }
+  const tier = tierByKey(session?.tier);
+  if (!session || !session.files.length || !tier) { await ctx.answerCallbackQuery('Нет данных.'); return ctx.reply('Нет активного импорта.', { reply_markup: mainMenu() }); }
   if (applying) { await ctx.answerCallbackQuery('Уже выполняется…'); return; }
-  applying = true;
-  await ctx.answerCallbackQuery();
+  applying = true; await ctx.answerCallbackQuery();
   try {
     const pointsMap = new Map(Object.entries(session.points));
     if (pointsMap.size) store.commitPoints(pointsMap);
-    const invited = await reinviteQualified(pointsMap);
+    const invited = await reinviteTier(pointsMap, tier);
     store.clearImport();
-    await ctx.reply(`Баллы обновлены, никого не удалял.\n✅ Приглашено (набрали баллы): ${invited}`, { reply_markup: mainMenu() });
-  } catch (e) {
-    console.error('adm_commit:', e.message);
-    await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() });
-  } finally {
-    applying = false;
-  }
+    await ctx.reply(`«${tier.name}»: баллы обновлены, никого не удалял.\n✅ Приглашено (набрали порог): ${invited}`, { reply_markup: mainMenu() });
+  } catch (e) { console.error('adm_commit', e.message); await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() }); }
+  finally { applying = false; }
 });
 
-// Подтверждение удаления — применяем ТОЛЬКО замороженный список из adm_calc.
 adminBot.callbackQuery('adm_confirm', async (ctx) => {
   const session = store.getImport();
-  if (!session || !session.files.length || !session.reviewed) {
-    await ctx.answerCallbackQuery('Сначала нажми «Посчитать».');
-    return ctx.reply('Сначала «✅ Посчитать на вылет», потом подтверждай.', { reply_markup: mainMenu() });
-  }
+  const tier = tierByKey(session?.tier);
+  if (!session || !session.reviewed || !tier) { await ctx.answerCallbackQuery('Сначала «Посчитать».'); return ctx.reply('Сначала «Посчитать», потом подтверждай.', { reply_markup: mainMenu() }); }
   if (applying) { await ctx.answerCallbackQuery('Уже выполняется, подожди…'); return; }
-  applying = true;
-  await ctx.answerCallbackQuery();
-  await ctx.reply(`⏳ Применяю: до ${session.reviewed.length} на удаление. Это может занять минуту…`);
-
+  applying = true; await ctx.answerCallbackQuery();
+  await ctx.reply(`⏳ «${tier.name}»: применяю удаление до ${session.reviewed.length}…`);
   try {
     const pointsMap = new Map(Object.entries(session.points));
     if (pointsMap.size) store.commitPoints(pointsMap);
-
-    let removed = 0, skipped = 0, stuck = 0;
+    let removed = 0, skipped = 0;
     for (const r of session.reviewed) {
       const m = store.getMember(r.doterraId);
       const pv = pointsMap.has(r.doterraId) ? pointsMap.get(r.doterraId) : null;
-      // повторная валидация: всё ещё в канале и всё ещё ниже порога
-      if (!m || !m.inChannel || pv == null || !(pv < THRESHOLD)) { skipped++; continue; }
-      const { banned, unbanFail } = await banEverywhere(m.userId);
+      if (!m || m.tiers?.[tier.key] !== 'in' || pv == null || !(pv < tier.threshold)) { skipped++; continue; }
+      const { banned } = await banFromTier(m.userId, tier);
       if (banned) {
-        store.setInChannel(m.doterraId, false);
-        store.setInvited(m.doterraId, false);
+        store.setTierState(m.doterraId, tier.key, null);
         removed++;
-        if (unbanFail) stuck++;
-        if (memberBot) {
-          try {
-            await memberBot.api.sendMessage(
-              m.userId,
-              `Доступ закрыт: ${pv} балл(ов), нужно ${THRESHOLD}. Набери баллы и нажми /check — снова откроем доступ.`
-            );
-          } catch {}
-        }
+        if (memberBot) { try { await memberBot.api.sendMessage(m.userId, `Доступ в «${tier.name}» закрыт: ${pv} балл(ов), нужно ${tier.threshold}. Набери баллы и нажми /check.`); } catch {} }
       }
-      await sleep(350); // троттлинг против лимитов Telegram
+      await sleep(350);
     }
-
-    const invited = await reinviteQualified(pointsMap);
+    const invited = await reinviteTier(pointsMap, tier);
     store.clearImport();
-
-    let msg = `Готово.\n🗑 Удалено: ${removed}\n✅ Приглашено (набрали баллы): ${invited}`;
-    if (skipped) msg += `\nℹ️ Пропущено (уже вышли/восстановились): ${skipped}`;
-    if (stuck) msg += `\n⚠️ У ${stuck} не удалось снять бан — проверь права бота и повтори.`;
+    let msg = `Готово по «${tier.name}».\n🗑 Удалено: ${removed}\n✅ Приглашено: ${invited}`;
+    if (skipped) msg += `\nℹ️ Пропущено (вышли/восстановились): ${skipped}`;
     await ctx.reply(msg, { reply_markup: mainMenu() });
-  } catch (e) {
-    console.error('adm_confirm:', e.message);
-    await ctx.reply('Ошибка при применении: ' + e.message, { reply_markup: mainMenu() });
-  } finally {
-    applying = false;
-  }
+  } catch (e) { console.error('adm_confirm', e.message); await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() }); }
+  finally { applying = false; }
 });
 } // if (adminBot)
 
@@ -624,15 +456,5 @@ adminBot.callbackQuery('adm_confirm', async (ctx) => {
 if (memberBot) memberBot.catch((err) => console.error('memberBot:', err.error?.message || err.message));
 if (adminBot) adminBot.catch((err) => console.error('adminBot:', err.error?.message || err.message));
 
-if (memberBot && wantMember) {
-  memberBot.start({
-    allowed_updates: ['message', 'callback_query', 'chat_member'],
-    onStart: () => console.log('✓ Бот участников запущен'),
-  });
-}
-if (adminBot && wantAdmin) {
-  adminBot.start({
-    allowed_updates: ['message', 'callback_query'],
-    onStart: () => console.log('✓ Админ-бот запущен'),
-  });
-}
+if (memberBot && wantMember) memberBot.start({ allowed_updates: ['message', 'callback_query', 'chat_member'], onStart: () => console.log('✓ Бот участников запущен') });
+if (adminBot && wantAdmin) adminBot.start({ allowed_updates: ['message', 'callback_query'], onStart: () => console.log('✓ Админ-бот запущен') });

@@ -1,10 +1,11 @@
 // Файловое хранилище в store.json.
-// ВАЖНО: каждая операция читает свежую версию файла с диска и сразу пишет
-// обратно. Это позволяет запускать бота участников и админ-бота как ДВА
-// ОТДЕЛЬНЫХ процесса (например две записи на bothost), которые делят один
-// store.json на общем диске и видят данные друг друга. STORE_DIR должен
-// указывать на ОБЩЕЕ постоянное хранилище (на bothost — /app/shared при
-// включённом «Общем хранилище»).
+// Каждая операция читает свежую версию файла и сразу пишет обратно — так бот
+// участников и админ-бот могут работать как ДВА процесса, деля один store.json
+// на общем диске (bothost: STORE_DIR=/app/shared при «Общем хранилище»).
+//
+// Членство участника хранится ПО КАЖДОМУ ЧАТУ (тиру) отдельно:
+//   member.tiers = { "1": "in" | "invited", "2": "in" | "invited", ... }
+//   "invited" — выдали ссылку, ждём входа; "in" — реально вступил.
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -14,13 +15,12 @@ const FILE = resolve(DIR, 'store.json');
 const TMP = resolve(DIR, 'store.json.tmp');
 
 const EMPTY = {
-  members: {}, // doterraId -> { doterraId, userId, username, name, registeredAt, invited, inChannel }
-  points: {}, // doterraId -> PV (последний снимок баллов)
+  members: {}, // doterraId -> { doterraId, userId, username, name, registeredAt, tiers:{} }
+  points: {}, // doterraId -> PV
   flows: {}, // userId -> { step }
-  import: null, // { points:{id:pv}, files:[{name,count}], by, reviewed:[{doterraId,userId,pv}] }
+  import: null, // { tier, points:{id:pv}, files:[], by, reviewed:[] }
 };
 
-// Свежая версия с диска.
 function db() {
   if (!existsSync(FILE)) return structuredClone(EMPTY);
   try {
@@ -30,7 +30,6 @@ function db() {
   }
 }
 
-// Атомичная запись (temp + rename), с созданием папки при необходимости.
 function persist(data) {
   try { mkdirSync(DIR, { recursive: true }); } catch {}
   writeFileSync(TMP, JSON.stringify(data, null, 2));
@@ -38,12 +37,11 @@ function persist(data) {
 }
 
 export function getData() { return db(); }
-export function save() { /* каждая операция пишет сама — оставлено для совместимости */ }
+export function save() {}
 
 // ── участники ───────────────────────────────────────────────────────────
 export function registerMember(doterraId, user) {
   const data = db();
-  // один Telegram-пользователь = одна регистрация: убираем прежнюю запись под другим ID
   for (const [id, m] of Object.entries(data.members)) {
     if (m.userId === user.id && id !== doterraId) delete data.members[id];
   }
@@ -54,8 +52,7 @@ export function registerMember(doterraId, user) {
     username: user.username || null,
     name: [user.first_name, user.last_name].filter(Boolean).join(' ') || prev.name || '',
     registeredAt: prev.registeredAt || new Date().toISOString(),
-    invited: prev.invited || false,
-    inChannel: prev.inChannel || false,
+    tiers: prev.tiers || {},
   };
   delete data.flows[user.id];
   persist(data);
@@ -75,14 +72,15 @@ export function listMembers() {
   return Object.values(db().members);
 }
 
-export function setInChannel(doterraId, value) {
+// Состояние участника в конкретном чате (тире): 'in' | 'invited' | null (убрать).
+export function setTierState(doterraId, tierKey, state) {
   const data = db();
-  if (data.members[doterraId]) { data.members[doterraId].inChannel = value; persist(data); }
-}
-
-export function setInvited(doterraId, value) {
-  const data = db();
-  if (data.members[doterraId]) { data.members[doterraId].invited = value; persist(data); }
+  const m = data.members[doterraId];
+  if (!m) return;
+  if (!m.tiers) m.tiers = {};
+  if (state) m.tiers[tierKey] = state;
+  else delete m.tiers[tierKey];
+  persist(data);
 }
 
 export function unbindMember(doterraId) {
@@ -103,8 +101,7 @@ export function rebindMember(doterraId, newUserId) {
   }
   m.userId = newUserId;
   m.username = null;
-  m.invited = false;
-  m.inChannel = false;
+  m.tiers = {}; // новый аккаунт ещё нигде не состоит
   persist(data);
   return m;
 }
@@ -116,7 +113,7 @@ export function getPoints(doterraId) {
 }
 
 export function commitPoints(pointsMap) {
-  const data = db(); // свежие members сохраняются, меняем только снимок баллов
+  const data = db();
   data.points = Object.fromEntries(pointsMap);
   persist(data);
 }
@@ -133,22 +130,22 @@ export function getFlow(userId) {
   return db().flows[userId] || null;
 }
 
-// ── сессия импорта у админа ───────────────────────────────────────────────
-export function startImport(userId) {
+// ── сессия импорта у админа (привязана к конкретному чату/тиру) ────────────
+export function startImport(userId, tier) {
   const data = db();
-  data.import = { points: {}, files: [], by: userId, reviewed: null };
+  data.import = { tier, points: {}, files: [], by: userId, reviewed: null };
   persist(data);
 }
 
 export function addImportFile(name, records) {
   const data = db();
-  if (!data.import) data.import = { points: {}, files: [], by: null, reviewed: null };
+  if (!data.import) data.import = { tier: null, points: {}, files: [], by: null, reviewed: null };
   let added = 0;
   for (const r of records) {
     const id = String(r.id ?? '').trim();
     if (!id) continue;
     const pv = Number(r.points ?? r.pv);
-    const val = Number.isFinite(pv) ? pv : 0; // пусто = 0
+    const val = Number.isFinite(pv) ? pv : 0;
     data.import.points[id] = Math.max(data.import.points[id] ?? -Infinity, val);
     added++;
   }
