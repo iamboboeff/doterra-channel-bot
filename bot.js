@@ -18,16 +18,39 @@ const ADMIN_IDS = new Set(
   (process.env.ADMIN_IDS || '').split(',').map((s) => Number(s.trim())).filter(Boolean)
 );
 
-if (!MEMBER_TOKEN || !ADMIN_TOKEN) {
-  console.error('Нет MEMBER_BOT_TOKEN или ADMIN_BOT_TOKEN в .env');
+// ROLE управляет тем, какой(ие) бот(ы) активно опрашивает ЭТОТ процесс —
+// удобно, когда участников- и админ-бот развёрнуты как ДВЕ отдельные записи
+// на хостинге (например bothost, где 1 запись = 1 токен):
+//   ROLE=member — опрашивает только бот участников
+//   ROLE=admin  — опрашивает только админ-бот
+//   ROLE=both   — оба в одном процессе (по умолчанию, как раньше)
+// Токен «второго» бота всё равно стоит указывать в обеих записях — админ-бот
+// им уведомляет участников и шлёт им ссылки-приглашения.
+const ROLE = (process.env.ROLE || 'both').toLowerCase();
+const wantMember = ROLE === 'member' || ROLE === 'both';
+const wantAdmin = ROLE === 'admin' || ROLE === 'both';
+
+if (!wantMember && !wantAdmin) {
+  console.error(`Неверный ROLE="${ROLE}". Допустимо: member, admin, both.`);
+  process.exit(1);
+}
+if (wantMember && !MEMBER_TOKEN) {
+  console.error(`ROLE=${ROLE} требует MEMBER_BOT_TOKEN в .env`);
+  process.exit(1);
+}
+if (wantAdmin && !ADMIN_TOKEN) {
+  console.error(`ROLE=${ROLE} требует ADMIN_BOT_TOKEN в .env`);
   process.exit(1);
 }
 if (!TARGETS.length) {
   console.warn('⚠️  Ни CHANNEL_ID, ни CHAT_ID не заданы — бот не сможет приглашать/удалять. Впиши CHANNEL_ID в .env.');
 }
 
-const memberBot = new Bot(MEMBER_TOKEN);
-const adminBot = new Bot(ADMIN_TOKEN);
+// Оба объекта создаём, если токен есть, — даже если этот процесс не «опрашивает»
+// соответствующего бота: его .api всё равно нужен (например, админ-процессу —
+// memberBot.api, чтобы слать участникам ссылки и уведомления).
+const memberBot = MEMBER_TOKEN ? new Bot(MEMBER_TOKEN) : null;
+const adminBot = ADMIN_TOKEN ? new Bot(ADMIN_TOKEN) : null;
 
 const isAdmin = (id) => ADMIN_IDS.has(id);
 const fmtPv = (pv) => (pv == null ? '—' : pv);
@@ -57,6 +80,10 @@ async function tgRetry(fn, tries = 4) {
 // Помечаем «приглашён» (не «в канале» — это подтвердит фактический вход).
 async function inviteToTargets(member) {
   if (!TARGETS.length) return false;
+  if (!memberBot) {
+    console.error('MEMBER_BOT_TOKEN не задан в этом процессе — не могу пригласить.');
+    return false;
+  }
   const expire = Math.floor(Date.now() / 1000) + 24 * 3600; // ссылка живёт сутки
   const links = [];
   for (const t of TARGETS) {
@@ -96,6 +123,10 @@ async function reinviteQualified(pointsMap) {
 
 // Кик из всех целей: бан выкидывает, разбан ТУТ ЖЕ (с повторами) снимает из ЧС.
 async function banEverywhere(userId) {
+  if (!adminBot) {
+    console.error('ADMIN_BOT_TOKEN не задан в этом процессе — не могу забанить.');
+    return { banned: false, unbanFail: false };
+  }
   let banned = false, unbanFail = false;
   for (const t of TARGETS) {
     try {
@@ -149,6 +180,7 @@ async function evaluateAndReply(ctx, member) {
 // ─────────────────────────────────────────────────────────────────────────
 //  БОТ УЧАСТНИКОВ
 // ─────────────────────────────────────────────────────────────────────────
+if (memberBot) {
 memberBot.command('start', async (ctx) => {
   const existing = store.findMemberByUser(ctx.from.id);
   if (existing) {
@@ -223,6 +255,7 @@ memberBot.on('chat_member', (ctx) => {
   const inside = status === 'member' || status === 'administrator' || status === 'creator';
   store.setInChannel(member.doterraId, inside);
 });
+} // if (memberBot)
 
 // ─────────────────────────────────────────────────────────────────────────
 //  АДМИН-БОТ
@@ -235,6 +268,7 @@ function mainMenu() {
     .text('ℹ️ Статус', 'adm_status');
 }
 
+if (adminBot) {
 adminBot.use(async (ctx, next) => {
   const uid = ctx.from?.id;
   if (uid && !isAdmin(uid)) {
@@ -553,12 +587,14 @@ adminBot.callbackQuery('adm_confirm', async (ctx) => {
         store.setInvited(m.doterraId, false);
         removed++;
         if (unbanFail) stuck++;
-        try {
-          await memberBot.api.sendMessage(
-            m.userId,
-            `Доступ закрыт: ${pv} балл(ов), нужно ${THRESHOLD}. Набери баллы и нажми /check — снова откроем доступ.`
-          );
-        } catch {}
+        if (memberBot) {
+          try {
+            await memberBot.api.sendMessage(
+              m.userId,
+              `Доступ закрыт: ${pv} балл(ов), нужно ${THRESHOLD}. Набери баллы и нажми /check — снова откроем доступ.`
+            );
+          } catch {}
+        }
       }
       await sleep(350); // троттлинг против лимитов Telegram
     }
@@ -577,16 +613,21 @@ adminBot.callbackQuery('adm_confirm', async (ctx) => {
     applying = false;
   }
 });
+} // if (adminBot)
 
 // ─────────────────────────────────────────────────────────────────────────
-memberBot.catch((err) => console.error('memberBot:', err.error?.message || err.message));
-adminBot.catch((err) => console.error('adminBot:', err.error?.message || err.message));
+if (memberBot) memberBot.catch((err) => console.error('memberBot:', err.error?.message || err.message));
+if (adminBot) adminBot.catch((err) => console.error('adminBot:', err.error?.message || err.message));
 
-memberBot.start({
-  allowed_updates: ['message', 'callback_query', 'chat_member'],
-  onStart: () => console.log('✓ Бот участников запущен'),
-});
-adminBot.start({
-  allowed_updates: ['message', 'callback_query'],
-  onStart: () => console.log('✓ Админ-бот запущен'),
-});
+if (memberBot && wantMember) {
+  memberBot.start({
+    allowed_updates: ['message', 'callback_query', 'chat_member'],
+    onStart: () => console.log('✓ Бот участников запущен'),
+  });
+}
+if (adminBot && wantAdmin) {
+  adminBot.start({
+    allowed_updates: ['message', 'callback_query'],
+    onStart: () => console.log('✓ Админ-бот запущен'),
+  });
+}
