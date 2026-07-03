@@ -1,34 +1,27 @@
-// Файловое хранилище в store.json. Хватает для канала на сотни человек.
-// Когда выложим на Cloud Run — заменим только этот модуль на Google-таблицу,
-// логика ботов не изменится.
-import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
+// Файловое хранилище в store.json.
+// ВАЖНО: каждая операция читает свежую версию файла с диска и сразу пишет
+// обратно. Это позволяет запускать бота участников и админ-бота как ДВА
+// ОТДЕЛЬНЫХ процесса (например две записи на bothost), которые делят один
+// store.json на общем диске и видят данные друг друга. STORE_DIR должен
+// указывать на ОБЩЕЕ постоянное хранилище (на bothost — /app/shared при
+// включённом «Общем хранилище»).
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
-// Где хранить store.json. На хостинге с постоянным диском (Volume) задайте
-// переменную STORE_DIR = путь к диску (например /data) — иначе файл сотрётся
-// при перезапуске, и все регистрации потеряются.
 const DIR = process.env.STORE_DIR || dirname(fileURLToPath(import.meta.url));
 const FILE = resolve(DIR, 'store.json');
 const TMP = resolve(DIR, 'store.json.tmp');
 
 const EMPTY = {
-  // doterraId -> { doterraId, userId, username, name, registeredAt, invited, inChannel }
-  //   invited   — выдали ссылку-приглашение (ждём фактического входа)
-  //   inChannel — реально вступил (по событию chat_member) → только таких удаляем
-  members: {},
-  // doterraId -> PV (последний загруженный снимок баллов)
-  points: {},
-  // userId -> { step }  состояние диалога (например awaiting_id)
-  flows: {},
-  // незавершённая сессия импорта у админа:
-  //   { points:{id:pv}, files:[{name,count}], by, reviewed:[{doterraId,userId,pv}] }
-  import: null,
+  members: {}, // doterraId -> { doterraId, userId, username, name, registeredAt, invited, inChannel }
+  points: {}, // doterraId -> PV (последний снимок баллов)
+  flows: {}, // userId -> { step }
+  import: null, // { points:{id:pv}, files:[{name,count}], by, reviewed:[{doterraId,userId,pv}] }
 };
 
-let data = load();
-
-function load() {
+// Свежая версия с диска.
+function db() {
   if (!existsSync(FILE)) return structuredClone(EMPTY);
   try {
     return { ...structuredClone(EMPTY), ...JSON.parse(readFileSync(FILE, 'utf8')) };
@@ -37,21 +30,20 @@ function load() {
   }
 }
 
-// Атомичная запись: пишем во временный файл и переименовываем — так падение
-// посреди записи не оставит битый store.json.
-export function save() {
+// Атомичная запись (temp + rename), с созданием папки при необходимости.
+function persist(data) {
+  try { mkdirSync(DIR, { recursive: true }); } catch {}
   writeFileSync(TMP, JSON.stringify(data, null, 2));
   renameSync(TMP, FILE);
 }
 
-export function getData() {
-  return data;
-}
+export function getData() { return db(); }
+export function save() { /* каждая операция пишет сама — оставлено для совместимости */ }
 
 // ── участники ───────────────────────────────────────────────────────────
 export function registerMember(doterraId, user) {
-  // Один Telegram-пользователь = одна регистрация: убираем его прежнюю запись
-  // под другим doTERRA ID (на случай, если ошибся и прислал новый).
+  const data = db();
+  // один Telegram-пользователь = одна регистрация: убираем прежнюю запись под другим ID
   for (const [id, m] of Object.entries(data.members)) {
     if (m.userId === user.id && id !== doterraId) delete data.members[id];
   }
@@ -66,52 +58,46 @@ export function registerMember(doterraId, user) {
     inChannel: prev.inChannel || false,
   };
   delete data.flows[user.id];
-  save();
+  persist(data);
   return data.members[doterraId];
 }
 
 export function findMemberByUser(userId) {
-  for (const m of Object.values(data.members)) if (m.userId === userId) return m;
+  for (const m of Object.values(db().members)) if (m.userId === userId) return m;
   return null;
 }
 
 export function getMember(doterraId) {
-  return data.members[doterraId] || null;
+  return db().members[doterraId] || null;
 }
 
 export function listMembers() {
-  return Object.values(data.members);
+  return Object.values(db().members);
 }
 
 export function setInChannel(doterraId, value) {
-  if (data.members[doterraId]) {
-    data.members[doterraId].inChannel = value;
-    save();
-  }
+  const data = db();
+  if (data.members[doterraId]) { data.members[doterraId].inChannel = value; persist(data); }
 }
 
 export function setInvited(doterraId, value) {
-  if (data.members[doterraId]) {
-    data.members[doterraId].invited = value;
-    save();
-  }
+  const data = db();
+  if (data.members[doterraId]) { data.members[doterraId].invited = value; persist(data); }
 }
 
-// Снять привязку ID (освободить). Возвращает удалённую запись или null.
 export function unbindMember(doterraId) {
+  const data = db();
   const m = data.members[doterraId];
   if (!m) return null;
   delete data.members[doterraId];
-  save();
+  persist(data);
   return m;
 }
 
-// Перепривязать существующий ID на другой Telegram-аккаунт.
-// Сбрасывает статусы (новый аккаунт ещё не приглашён и не в канале).
 export function rebindMember(doterraId, newUserId) {
+  const data = db();
   const m = data.members[doterraId];
   if (!m) return null;
-  // если у нового аккаунта была своя регистрация под другим ID — убираем её
   for (const [id, mm] of Object.entries(data.members)) {
     if (mm.userId === newUserId && id !== doterraId) delete data.members[id];
   }
@@ -119,71 +105,70 @@ export function rebindMember(doterraId, newUserId) {
   m.username = null;
   m.invited = false;
   m.inChannel = false;
-  save();
+  persist(data);
   return m;
 }
 
-// ── баллы (последний снимок) ──────────────────────────────────────────────
+// ── баллы ─────────────────────────────────────────────────────────────────
 export function getPoints(doterraId) {
+  const data = db();
   return Object.prototype.hasOwnProperty.call(data.points, doterraId) ? data.points[doterraId] : null;
 }
 
 export function commitPoints(pointsMap) {
-  // pointsMap: Map<id, pv> — заменяем снимок целиком
+  const data = db(); // свежие members сохраняются, меняем только снимок баллов
   data.points = Object.fromEntries(pointsMap);
-  save();
+  persist(data);
 }
 
-// ── состояние диалога ─────────────────────────────────────────────────────
+// ── диалог ──────────────────────────────────────────────────────────────
 export function setFlow(userId, step) {
+  const data = db();
   if (step) data.flows[userId] = { step };
   else delete data.flows[userId];
-  save();
+  persist(data);
 }
 
 export function getFlow(userId) {
-  return data.flows[userId] || null;
+  return db().flows[userId] || null;
 }
 
 // ── сессия импорта у админа ───────────────────────────────────────────────
 export function startImport(userId) {
+  const data = db();
   data.import = { points: {}, files: [], by: userId, reviewed: null };
-  save();
+  persist(data);
 }
 
 export function addImportFile(name, records) {
-  if (!data.import) startImport(null);
+  const data = db();
+  if (!data.import) data.import = { points: {}, files: [], by: null, reviewed: null };
   let added = 0;
   for (const r of records) {
     const id = String(r.id ?? '').trim();
     if (!id) continue;
     const pv = Number(r.points ?? r.pv);
-    // Пустой/битый PV = 0 баллов (по решению заказчика: пусто = неактивен).
-    const val = Number.isFinite(pv) ? pv : 0;
-    // дубль из двух кабинетов — берём максимум
+    const val = Number.isFinite(pv) ? pv : 0; // пусто = 0
     data.import.points[id] = Math.max(data.import.points[id] ?? -Infinity, val);
     added++;
   }
   data.import.files.push({ name, count: added });
-  data.import.reviewed = null; // новый файл — прежний расчёт больше не актуален
-  save();
+  data.import.reviewed = null;
+  persist(data);
   return added;
 }
 
-// Замораживаем список «на вылет», который показали админу, — именно его (и
-// только его) применит подтверждение. Ничего нового в момент бана не добавится.
 export function setReviewed(list) {
-  if (data.import) {
-    data.import.reviewed = list;
-    save();
-  }
+  const data = db();
+  if (data.import) { data.import.reviewed = list; persist(data); }
 }
 
 export function getImport() {
-  return data.import;
+  return db().import;
 }
 
 export function clearImport() {
+  const data = db();
   data.import = null;
-  save();
+  persist(data);
 }

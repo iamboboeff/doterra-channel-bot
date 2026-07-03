@@ -17,6 +17,11 @@ const TARGETS = [
 const ADMIN_IDS = new Set(
   (process.env.ADMIN_IDS || '').split(',').map((s) => Number(s.trim())).filter(Boolean)
 );
+// Админов можно задавать и по @username (без @), через запятую — удобно, когда
+// не знаешь числовой user_id человека. Сравнение без учёта регистра.
+const ADMIN_USERNAMES = new Set(
+  (process.env.ADMIN_USERNAMES || '').split(',').map((s) => s.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)
+);
 
 // ROLE управляет тем, какой(ие) бот(ы) активно опрашивает ЭТОТ процесс —
 // удобно, когда участников- и админ-бот развёрнуты как ДВЕ отдельные записи
@@ -52,7 +57,8 @@ if (!TARGETS.length) {
 const memberBot = MEMBER_TOKEN ? new Bot(MEMBER_TOKEN) : null;
 const adminBot = ADMIN_TOKEN ? new Bot(ADMIN_TOKEN) : null;
 
-const isAdmin = (id) => ADMIN_IDS.has(id);
+const isAdmin = (u) =>
+  !!u && (ADMIN_IDS.has(u.id) || (u.username && ADMIN_USERNAMES.has(u.username.toLowerCase())));
 const fmtPv = (pv) => (pv == null ? '—' : pv);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -270,10 +276,9 @@ function mainMenu() {
 
 if (adminBot) {
 adminBot.use(async (ctx, next) => {
-  const uid = ctx.from?.id;
-  if (uid && !isAdmin(uid)) {
+  if (ctx.from && !isAdmin(ctx.from)) {
     if (ctx.callbackQuery) await ctx.answerCallbackQuery('Только для администратора.');
-    else await ctx.reply(`Этот бот только для администратора. Твой user_id: ${uid}`);
+    else await ctx.reply(`Этот бот только для администратора. Твой user_id: ${ctx.from.id}`);
     return;
   }
   await next();
