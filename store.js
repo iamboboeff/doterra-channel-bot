@@ -19,6 +19,7 @@ const EMPTY = {
   points: {}, // doterraId -> PV
   flows: {}, // userId -> { step }
   import: null, // { tier, points:{id:pv}, files:[], by, reviewed:[] }
+  admins: [], // userId[] — авто-админы (первые N, написавшие /start админ-боту)
 };
 
 function db() {
@@ -38,6 +39,16 @@ function persist(data) {
 
 export function getData() { return db(); }
 export function save() {}
+
+// ── авто-админы (фолбэк: первые N, написавшие /start админ-боту) ────────────
+export function getAutoAdmins() { return db().admins || []; }
+
+export function addAutoAdmin(userId) {
+  const data = db();
+  if (!data.admins) data.admins = [];
+  if (!data.admins.includes(userId)) { data.admins.push(userId); persist(data); }
+  return data.admins;
+}
 
 // ── участники ───────────────────────────────────────────────────────────
 export function registerMember(doterraId, user) {

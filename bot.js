@@ -36,6 +36,9 @@ const ADMIN_IDS = new Set(
 const ADMIN_USERNAMES = new Set(
   (process.env.ADMIN_USERNAMES || '').split(',').map((s) => s.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)
 );
+// Фолбэк-админы: первые N человек, написавших /start админ-боту, становятся
+// администраторами (на случай, если id/ник не заданы). 0 — выключить.
+const MAX_AUTO_ADMINS = Number.isFinite(Number(process.env.MAX_AUTO_ADMINS)) ? Number(process.env.MAX_AUTO_ADMINS) : 5;
 
 // ROLE: both | member | admin — какой бот активно опрашивает Telegram (для
 // раздельного деплоя двух записей). Токен «второго» бота всё равно указываем —
@@ -53,7 +56,7 @@ const memberBot = MEMBER_TOKEN ? new Bot(MEMBER_TOKEN) : null;
 const adminBot = ADMIN_TOKEN ? new Bot(ADMIN_TOKEN) : null;
 
 const isAdmin = (u) =>
-  !!u && (ADMIN_IDS.has(u.id) || (u.username && ADMIN_USERNAMES.has(u.username.toLowerCase())));
+  !!u && (ADMIN_IDS.has(u.id) || (u.username && ADMIN_USERNAMES.has(u.username.toLowerCase())) || store.getAutoAdmins().includes(u.id));
 const fmtPv = (pv) => (pv == null ? '—' : pv);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -207,9 +210,16 @@ function mainMenu() {
 if (adminBot) {
 adminBot.use(async (ctx, next) => {
   if (ctx.from && !isAdmin(ctx.from)) {
-    if (ctx.callbackQuery) await ctx.answerCallbackQuery('Только для администратора.');
-    else await ctx.reply(`Этот бот только для администратора. Твой user_id: ${ctx.from.id}`);
-    return;
+    // Фолбэк: первые MAX_AUTO_ADMINS, написавшие /start, становятся админами.
+    const isStart = ctx.message?.text?.trim().startsWith('/start');
+    if (isStart && MAX_AUTO_ADMINS > 0 && store.getAutoAdmins().length < MAX_AUTO_ADMINS) {
+      store.addAutoAdmin(ctx.from.id);
+      await ctx.reply('✅ Ты добавлен как администратор (по фолбэку «первые запустившие»).');
+    } else {
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery('Только для администратора.');
+      else await ctx.reply(`Этот бот только для администратора. Твой user_id: ${ctx.from.id}`);
+      return;
+    }
   }
   await next();
 });
