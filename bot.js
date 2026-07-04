@@ -189,6 +189,12 @@ bot.command('check', async (ctx) => {
 
 bot.command('whoami', (ctx) => ctx.reply(`Твой user_id: ${ctx.from.id}`));
 
+// Узнать ID чата: напиши /id прямо в нужном чате (бот должен быть там участником/
+// админом). Пригодится, чтобы вписать TIERn_ID в .env.
+bot.command(['id', 'chatid'], (ctx) =>
+  ctx.reply(`chat id: \`${ctx.chat.id}\`\nтип: ${ctx.chat.type}${ctx.chat.title ? `\n${ctx.chat.title}` : ''}`, { parse_mode: 'Markdown' })
+);
+
 bot.command('help', (ctx) => {
   if (isAdmin(ctx.from)) {
     return ctx.reply('Команды админа:\n• /admin — открыть панель\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой Telegram-аккаунт\n• /unbind <ID> — снять привязку ID (и выгнать из чатов)\n• /whoami — твой user_id\n\nОбновление подписчиков и списки — через меню /admin.');
@@ -476,9 +482,17 @@ bot.on('chat_member', (ctx) => {
   store.setTierState(member.doterraId, t.key, inside ? 'in' : null);
 });
 
+// Бота добавили в чат / сменили статус → печатаем id чата в лог хостинга.
+// Удобно, чтобы узнать TIERn_ID сразу после добавления бота в чат.
+bot.on('my_chat_member', (ctx) => {
+  const c = ctx.chat;
+  const status = ctx.myChatMember?.new_chat_member?.status;
+  console.log(`ℹ️ Чат: id=${c.id} type=${c.type} status=${status} title=${JSON.stringify(c.title || '')}`);
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 bot.catch((err) => console.error('bot:', err.error?.message || err.message));
 bot.start({
-  allowed_updates: ['message', 'callback_query', 'chat_member'],
+  allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member'],
   onStart: () => console.log('✓ Бот запущен (участники + админка в одном)'),
 });
