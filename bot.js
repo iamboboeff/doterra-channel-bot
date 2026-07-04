@@ -60,6 +60,16 @@ const isAdmin = (u) =>
 const fmtPv = (pv) => (pv == null ? '—' : pv);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ── Помощники вывода ────────────────────────────────────────────────────────
+const escHtml = (s) => String(s ?? '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+// Кликабельное имя, открывающее профиль в Telegram (работает и без @username).
+const mention = (userId, name) => `<a href="tg://user?id=${userId}">${escHtml(name || '—')}</a>`;
+// Строка человека без HTML (для запасного текстового варианта).
+const plainName = (m) => `${m.name || '—'}${m.username ? ' @' + m.username : ''}`;
+// Список с ограничением по количеству, чтобы не порвать HTML при обрезке.
+const renderPeople = (arr, fmt, cap = 30) =>
+  arr.slice(0, cap).map(fmt).join('\n') + (arr.length > cap ? `\n… и ещё ${arr.length - cap}` : '');
+
 let applying = false;
 const adminState = new Map();
 
@@ -344,35 +354,41 @@ bot.callbackQuery('adm_cancel', async (ctx) => {
 bot.callbackQuery('adm_unreg', async (ctx) => {
   await ctx.answerCallbackQuery();
   const seen = store.listSeen();
-  const blocks = [];
+  const htmlBlocks = [], plainBlocks = [];
   for (const t of TIERS) {
     if (!t.id) continue;
-    const rows = new Map(); // userId -> строка (чтобы не дублировать)
+    const people = new Map(); // userId -> { userId, name, username, admin }
     for (const s of seen) {
       if (!s.tiers?.[t.key]) continue;
-      if (store.findMemberByUser(s.userId)) continue;         // уже привязан
-      if (isAdmin({ id: s.userId, username: s.username })) continue; // это управляющий бота
-      rows.set(s.userId, `• ${s.name || '—'}${s.username ? ' @' + s.username : ''} · id ${s.userId}`);
+      if (store.findMemberByUser(s.userId)) continue;          // уже привязан
+      if (isAdmin({ id: s.userId, username: s.username })) continue; // управляющий бота
+      people.set(s.userId, { userId: s.userId, name: s.name, username: s.username });
     }
     try {
       for (const a of await bot.api.getChatAdministrators(t.id)) {
         const u = a.user;
-        if (u.is_bot || rows.has(u.id) || store.findMemberByUser(u.id) || isAdmin({ id: u.id, username: u.username })) continue;
-        rows.set(u.id, `• ${[u.first_name, u.last_name].filter(Boolean).join(' ') || '—'}${u.username ? ' @' + u.username : ''} · id ${u.id} (админ чата)`);
+        if (u.is_bot || people.has(u.id) || store.findMemberByUser(u.id) || isAdmin({ id: u.id, username: u.username })) continue;
+        people.set(u.id, { userId: u.id, name: [u.first_name, u.last_name].filter(Boolean).join(' '), username: u.username, admin: true });
       }
     } catch {}
     let total = null;
     try { total = await bot.api.getChatMemberCount(t.id); } catch {}
     const registeredIn = store.listMembers().filter((m) => m.tiers?.[t.key] === 'in').length;
-    const unlinked = total != null ? Math.max(0, total - 1 - registeredIn) : null; // всего без привязки (кроме бота)
-    const silent = unlinked != null ? Math.max(0, unlinked - rows.size) : null;      // из них молчуны
-    const head = `«${t.name}» — в чате ${total ?? '?'}` + (unlinked != null ? `, без привязки ~${unlinked}` : '');
-    const seenLine = `👀 Знаю по имени — ${rows.size}` + (silent ? ` (ещё ~${silent} молчат, их не видно)` : '') + ':';
-    blocks.push(`${head}\n${seenLine}\n${[...rows.values()].join('\n') || '—'}`);
+    const unlinked = total != null ? Math.max(0, total - 1 - registeredIn) : null;
+    const list = [...people.values()];
+    const silent = unlinked != null ? Math.max(0, unlinked - list.length) : null;
+    const countPart = `в чате ${total ?? '?'}` + (unlinked != null ? `, без привязки ~${unlinked}` : '');
+    const seenLine = `👀 Знаю по имени — ${list.length}` + (silent ? ` (ещё ~${silent} молчат, их не видно)` : '') + ':';
+    const htmlList = list.length ? renderPeople(list, (p) => `• ${mention(p.userId, p.name)}${p.username ? ' @' + escHtml(p.username) : ''}${p.admin ? ' (админ чата)' : ''}`) : '—';
+    const plainList = list.length ? renderPeople(list, (p) => `• ${plainName(p)}${p.admin ? ' (админ чата)' : ''}`) : '—';
+    htmlBlocks.push(`«${escHtml(t.name)}» — ${countPart}\n${seenLine}\n${htmlList}`);
+    plainBlocks.push(`«${t.name}» — ${countPart}\n${seenLine}\n${plainList}`);
   }
-  const text = (blocks.join('\n\n') || 'Чаты не настроены.') +
-    '\n\nℹ️ По именам видны только те, кто писал/входил при боте или админы. Чтобы «вытащить» молчунов — попроси всех что-нибудь написать в чате.';
-  await ctx.reply(text.length > 3900 ? text.slice(0, 3900) + '\n…' : text, { reply_markup: mainMenu() });
+  const footer = '\n\nℹ️ По именам видны только те, кто писал/входил при боте или админы. Чтобы «вытащить» молчунов — попроси всех что-нибудь написать в чате.';
+  const html = (htmlBlocks.join('\n\n') || 'Чаты не настроены.') + footer;
+  const plain = (plainBlocks.join('\n\n') || 'Чаты не настроены.') + footer;
+  try { await ctx.reply(html, { parse_mode: 'HTML', reply_markup: mainMenu() }); }
+  catch (e) { console.error('adm_unreg', e.message); await ctx.reply(plain.slice(0, 4000), { reply_markup: mainMenu() }); }
 });
 
 // ── Отвязка участника кнопкой ──
@@ -444,21 +460,39 @@ bot.callbackQuery('adm_calc', async (ctx) => {
   const { toRemove, missing } = classify(inTier, pointsMap, tier.threshold);
   store.setReviewed(toRemove.map((m) => ({ doterraId: m.doterraId, userId: m.userId, pv: m.pv })));
 
+  // Кого пригласим: привязанные, кто набрал порог и ещё не в чате/не приглашён.
+  const toInvite = store.listMembers().filter((m) => {
+    if (m.tiers?.[tier.key]) return false;
+    const pv = pointsMap.get(m.doterraId);
+    return !!tier.id && pv != null && pv >= tier.threshold;
+  });
+  const inviteHtml = toInvite.length
+    ? `\n\n➕ <b>Пригласим</b> (набрали ${tier.threshold}+) — ${toInvite.length}:\n` +
+      renderPeople(toInvite, (m, i) => `${i + 1}. ${mention(m.userId, m.name)}${m.username ? ' @' + escHtml(m.username) : ''} · ${pointsMap.get(m.doterraId)} б.`)
+    : '';
+  const invitePlain = toInvite.length
+    ? `\n\n➕ Пригласим — ${toInvite.length}:\n` + renderPeople(toInvite, (m, i) => `${i + 1}. ${plainName(m)} · ${pointsMap.get(m.doterraId)} б.`)
+    : '';
+
+  const kbRemove = new InlineKeyboard().text(`🗑 Удалить ${toRemove.length}`, 'adm_confirm').text('❌ Отмена', 'adm_cancel');
+  const kbKeep = new InlineKeyboard().text('✅ Обновить баллы + пригласить', 'adm_commit').text('❌ Отмена', 'adm_cancel');
+
   if (!toRemove.length) {
     const body = inTier.length === 0
-      ? `«${tier.name}»: под удаление никто не попал — в чате нет ни одного привязанного участника.`
-      : `«${tier.name}»: удалять некого — все привязанные в чате набрали ${tier.threshold}+.`;
-    await ctx.reply(
-      note + body + (missing.length ? `\n(${missing.length} без данных — не тронуты.)` : ''),
-      { reply_markup: new InlineKeyboard().text('✅ Обновить баллы (без удаления)', 'adm_commit').text('❌ Отмена', 'adm_cancel') }
-    );
+      ? `«${escHtml(tier.name)}»: под удаление никто не попал — в чате нет ни одного привязанного участника.`
+      : `«${escHtml(tier.name)}»: удалять некого — все привязанные в чате набрали ${tier.threshold}+.`;
+    const tail = missing.length ? `\n(${missing.length} без данных — не тронуты.)` : '';
+    try { await ctx.reply(note + body + tail + inviteHtml, { parse_mode: 'HTML', reply_markup: kbKeep }); }
+    catch (e) { console.error('adm_calc', e.message); await ctx.reply((note + body + tail + invitePlain).slice(0, 4000), { reply_markup: kbKeep }); }
     return;
   }
-  const list = toRemove.map((m, i) => `${i + 1}. ${m.name || '—'} · ${m.doterraId} · ${m.pv} б.`).join('\n');
-  const text = note + `❌ На вылет из «${tier.name}» — ${toRemove.length} (баллов < ${tier.threshold}):\n${list}` + (missing.length ? `\n\n⚠️ Без данных, не тронем: ${missing.length}` : '') + `\n\nПодтвердить удаление?`;
-  await ctx.reply(text.length > 3800 ? text.slice(0, 3800) + '\n… (длинный список)' : text, {
-    reply_markup: new InlineKeyboard().text(`🗑 Удалить ${toRemove.length}`, 'adm_confirm').text('❌ Отмена', 'adm_cancel'),
-  });
+  const missTail = missing.length ? `\n\n⚠️ Без данных, не тронем: ${missing.length}` : '';
+  const listHtml = renderPeople(toRemove, (m, i) => `${i + 1}. ${mention(m.userId, m.name)}${m.username ? ' @' + escHtml(m.username) : ''} · ${m.pv} б.`);
+  const listPlain = renderPeople(toRemove, (m, i) => `${i + 1}. ${plainName(m)} · ${m.pv} б.`);
+  const html = note + `❌ <b>На вылет</b> из «${escHtml(tier.name)}» — ${toRemove.length} (баллов &lt; ${tier.threshold}):\n${listHtml}` + missTail + inviteHtml + `\n\nПодтвердить удаление?`;
+  const plain = note + `❌ На вылет из «${tier.name}» — ${toRemove.length} (баллов < ${tier.threshold}):\n${listPlain}` + missTail + invitePlain + `\n\nПодтвердить удаление?`;
+  try { await ctx.reply(html, { parse_mode: 'HTML', reply_markup: kbRemove }); }
+  catch (e) { console.error('adm_calc', e.message); await ctx.reply(plain.slice(0, 4000), { reply_markup: kbRemove }); }
 });
 
 // Приглашаем в тир всех, кто набрал его порог и ещё не в нём/не приглашён.
