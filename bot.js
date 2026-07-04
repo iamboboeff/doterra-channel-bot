@@ -104,6 +104,35 @@ async function kickFromAllTiers(member) {
   }
 }
 
+// Реальный статус участника в чате тира (getChatMember). Возвращает объект
+// статуса или null, если проверить нельзя (нет id/юзера или Telegram-ошибка).
+async function chatMemberStatus(tier, userId) {
+  if (!tier.id || !userId) return null;
+  try { return await tgRetry(() => bot.api.getChatMember(tier.id, userId)); }
+  catch { return null; }
+}
+const isInsideStatus = (cm) =>
+  !!cm && (cm.status === 'member' || cm.status === 'administrator' || cm.status === 'creator' || (cm.status === 'restricted' && cm.is_member));
+
+// Сверяет по getChatMember, кто из ЗАРЕГИСТРИРОВАННЫХ реально сейчас в чате тира,
+// и обновляет их состояние: вошёл → 'in', вышел → снимаем. «Приглашённых» (ещё
+// не вошедших) не трогаем. Незарегистрированных бот не видит в принципе.
+// Возвращает { checked, inside }.
+async function syncTierMembership(tier) {
+  let checked = 0, inside = 0;
+  if (!tier.id) return { checked, inside };
+  for (const m of store.listMembers()) {
+    if (!m.userId) continue;
+    const cm = await chatMemberStatus(tier, m.userId);
+    await sleep(40);
+    if (!cm) continue; // не смогли проверить — состояние не меняем
+    checked++;
+    if (isInsideStatus(cm)) { store.setTierState(m.doterraId, tier.key, 'in'); inside++; }
+    else if (m.tiers?.[tier.key] === 'in') store.setTierState(m.doterraId, tier.key, null); // вышел
+  }
+  return { checked, inside };
+}
+
 // По текущим баллам приглашаем участника во все чаты, где он проходит порог и
 // ещё не состоит. Возвращает { links, inNow, lack, soon }.
 async function admit(member) {
@@ -115,6 +144,10 @@ async function admit(member) {
     const state = fresh.tiers?.[t.key];
     if (pv >= t.threshold) {
       if (state === 'in') { res.inNow.push(t.name); continue; }
+      // Уже в чате (например, вступил до бота)? Пометим 'in' и не шлём лишнюю ссылку.
+      if (t.id && isInsideStatus(await chatMemberStatus(t, fresh.userId))) {
+        store.setTierState(fresh.doterraId, t.key, 'in'); res.inNow.push(t.name); continue;
+      }
       const link = await inviteLink(fresh, t);
       if (link) { res.links.push(`${t.name}: ${link}`); store.setTierState(fresh.doterraId, t.key, 'invited'); }
       else res.soon.push(t.name); // чат ещё не подключён
@@ -154,6 +187,17 @@ function mainMenu() {
 }
 const showAdminPanel = (ctx) =>
   ctx.reply('Админ-панель doTERRA. Выбери действие ниже.\nЕщё команды — /help.', { reply_markup: mainMenu() });
+
+// Пассивное отслеживание членства: если ЗАРЕГИСТРИРОВАННЫЙ участник пишет в
+// чате-тире — значит он реально там; помечаем 'in'. Сообщение не перехватываем.
+bot.on('message', async (ctx, next) => {
+  const t = tierByChat(ctx.chat?.id);
+  if (t && ctx.from) {
+    const m = store.findMemberByUser(ctx.from.id);
+    if (m && m.tiers?.[t.key] !== 'in') store.setTierState(m.doterraId, t.key, 'in');
+  }
+  await next();
+});
 
 // /start — админ сразу попадает в панель, остальные регистрируются.
 bot.command('start', async (ctx) => {
@@ -345,6 +389,18 @@ bot.callbackQuery('adm_calc', async (ctx) => {
   await ctx.answerCallbackQuery();
   const tier = tierByKey(session?.tier);
   if (!session || !session.files.length || !tier) return ctx.reply('Сначала выбери чат и пришли CSV.');
+
+  // Сверяем реальное членство перед подсчётом: кто из привязанных сейчас в чате.
+  let note = '';
+  if (tier.id) {
+    await ctx.reply('🔄 Проверяю, кто сейчас в чате…');
+    const { checked, inside } = await syncTierMembership(tier);
+    let total = null;
+    try { total = await bot.api.getChatMemberCount(tier.id); } catch {}
+    note = `В чате всего: ${total ?? '?'}, из них привязано к боту: ${inside}.\n`;
+    if (total != null && total - 1 > inside) note += `⚠️ ${total - 1 - inside} чел. не зарегистрированы — их бот не видит и удалить не может (пусть напишут боту свой doTERRA ID).\n`;
+  }
+
   const pointsMap = new Map(Object.entries(session.points));
   const inTier = store.listMembers().filter((m) => m.tiers?.[session.tier] === 'in');
   const { toRemove, missing } = classify(inTier, pointsMap, tier.threshold);
@@ -352,13 +408,13 @@ bot.callbackQuery('adm_calc', async (ctx) => {
 
   if (!toRemove.length) {
     await ctx.reply(
-      `«${tier.name}»: удалять некого — все набрали ${tier.threshold}+.` + (missing.length ? `\n(${missing.length} без данных — не тронуты.)` : ''),
+      note + `«${tier.name}»: удалять некого — все привязанные в чате набрали ${tier.threshold}+.` + (missing.length ? `\n(${missing.length} без данных — не тронуты.)` : ''),
       { reply_markup: new InlineKeyboard().text('✅ Обновить баллы (без удаления)', 'adm_commit').text('❌ Отмена', 'adm_cancel') }
     );
     return;
   }
   const list = toRemove.map((m, i) => `${i + 1}. ${m.name || '—'} · ${m.doterraId} · ${m.pv}`).join('\n');
-  const text = `❌ ИЗ «${tier.name}» НА ВЫЛЕТ (PV < ${tier.threshold}) — ${toRemove.length}:\n${list}` + (missing.length ? `\n\n⚠️ Без данных (не тронем): ${missing.length}` : '') + `\n\nПодтвердить удаление?`;
+  const text = note + `❌ ИЗ «${tier.name}» НА ВЫЛЕТ (PV < ${tier.threshold}) — ${toRemove.length}:\n${list}` + (missing.length ? `\n\n⚠️ Без данных (не тронем): ${missing.length}` : '') + `\n\nПодтвердить удаление?`;
   await ctx.reply(text.length > 3800 ? text.slice(0, 3800) + '\n… (длинный список)' : text, {
     reply_markup: new InlineKeyboard().text(`🗑 Удалить ${toRemove.length}`, 'adm_confirm').text('❌ Отмена', 'adm_cancel'),
   });
@@ -434,6 +490,7 @@ bot.callbackQuery('adm_confirm', async (ctx) => {
 //  ТЕКСТ И СОБЫТИЯ ЧАТА
 // ─────────────────────────────────────────────────────────────────────────
 bot.on('message:text', async (ctx) => {
+  if (ctx.chat?.type !== 'private') return; // регистрация/отвязка — только в личке, не в группах
   // 1) Админ вводит ID для отвязки — этот шаг в приоритете.
   const st = adminState.get(ctx.from.id);
   if (isAdmin(ctx.from) && st?.step === 'await_unbind_id') {
