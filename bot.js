@@ -162,17 +162,16 @@ async function evaluateAndReply(ctx, member) {
   const r = await admit(member);
   if (r.pv == null) {
     await ctx.reply(
-      `ID *${member.doterraId}* принят ✅\nБаллы появятся после ближайшего обновления базы — я напишу, как откроется доступ.`,
-      { parse_mode: 'Markdown' }
+      `✅ Готово — ID ${member.doterraId} принят!\n\nБаллы подтянутся при ближайшем обновлении базы. Как только доступ откроется, я сразу напишу.`
     );
     return;
   }
   let msg = '';
-  if (r.links.length) msg += `✅ Доступ открыт! Заходи (ссылки одноразовые, действуют сутки):\n\n${r.links.join('\n')}\n\n`;
-  if (r.inNow.length) msg += `Ты уже в: ${r.inNow.join(', ')}.\n`;
-  if (r.soon.length) msg += `Доступ положен, но ${r.soon.join(', ')} ещё настраивается — нажми /check позже.\n`;
-  if (r.lack.length) msg += `Пока не хватает баллов (у тебя ${r.pv}): ${r.lack.join('; ')}.\n`;
-  await ctx.reply((msg || `Баллов: ${r.pv}. Доступных чатов сейчас нет.`).trim());
+  if (r.links.length) msg += `🎉 Доступ открыт! Заходи по ссылкам ниже (одноразовые, действуют сутки):\n\n${r.links.join('\n')}\n\n`;
+  if (r.inNow.length) msg += `✅ Ты уже в: ${r.inNow.join(', ')}.\n`;
+  if (r.soon.length) msg += `⏳ Доступ положен, но ${r.soon.join(', ')} ещё настраивается — загляни позже через /check.\n`;
+  if (r.lack.length) msg += `📊 Пока не хватает баллов (у тебя ${r.pv}):\n• ${r.lack.join('\n• ')}\n`;
+  await ctx.reply((msg || `Твои баллы: ${r.pv}. Доступных чатов пока нет.`).trim());
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -187,7 +186,7 @@ function mainMenu() {
     .text('ℹ️ Статус', 'adm_status');
 }
 const showAdminPanel = (ctx) =>
-  ctx.reply('Админ-панель doTERRA. Выбери действие ниже.\nЕщё команды — /help.', { reply_markup: mainMenu() });
+  ctx.reply('🛠 Админ-панель doTERRA\n\nВыбери действие кнопкой ниже. Другие команды — /help.', { reply_markup: mainMenu() });
 
 // Пассивное отслеживание членства: если ЗАРЕГИСТРИРОВАННЫЙ участник пишет в
 // чате-тире — значит он реально там; помечаем 'in'. Сообщение не перехватываем.
@@ -207,11 +206,11 @@ bot.command('start', async (ctx) => {
   const existing = store.findMemberByUser(ctx.from.id);
   if (existing) {
     const pv = store.getPoints(existing.doterraId);
-    await ctx.reply(`Ты уже зарегистрирован.\nID: ${existing.doterraId}\nБаллы: ${fmtPv(pv)}\n\nНажми /check для проверки доступа, или пришли другой ID, если ошибся.`);
+    await ctx.reply(`✅ Ты уже зарегистрирован.\n\n🆔 doTERRA ID: ${existing.doterraId}\n⭐️ Баллы: ${fmtPv(pv)}\n\nНажми /check — проверю доступ в чаты. Ошибся с ID? Просто пришли правильный.`);
     return;
   }
   store.setFlow(ctx.from.id, 'awaiting_id');
-  await ctx.reply(`Привет! 👋\nЧтобы попасть в чат «Бережное врачевание», напиши тут свой *ID участника doTERRA* — это номер из кабинета (обычно 7–8 цифр).\nНапример: 18170008`, { parse_mode: 'Markdown' });
+  await ctx.reply(`👋 Привет! Это бот доступа в чаты «Бережное врачевание».\n\nЧтобы войти, пришли свой ID участника doTERRA — номер из личного кабинета (обычно 7–8 цифр).\n\nНапример: 18170008`);
 });
 
 // /admin — явный вход в панель. Для не-админа работает только как первичная
@@ -223,36 +222,37 @@ bot.command('admin', async (ctx) => {
     await ctx.reply('✅ Ты добавлен как администратор (первичная настройка).');
     return showAdminPanel(ctx);
   }
-  await ctx.reply('Команда доступна только администраторам.');
+  await ctx.reply('Эта команда только для администраторов.');
 });
 
 // /check — проверка своего доступа (для участников).
 bot.command('check', async (ctx) => {
   const member = store.findMemberByUser(ctx.from.id);
-  if (!member) { store.setFlow(ctx.from.id, 'awaiting_id'); await ctx.reply('Ты ещё не зарегистрирован. Пришли свой ID doTERRA (7–8 цифр).'); return; }
+  if (!member) { store.setFlow(ctx.from.id, 'awaiting_id'); await ctx.reply('Ты ещё не зарегистрирован 🙂\nПришли свой doTERRA ID (7–8 цифр) — и я проверю доступ.'); return; }
   await evaluateAndReply(ctx, member);
 });
 
-bot.command('whoami', (ctx) => ctx.reply(`Твой user_id: ${ctx.from.id}`));
+bot.command('whoami', (ctx) => ctx.reply(`🆔 Твой Telegram user_id: ${ctx.from.id}`));
 
 // Узнать ID чата: напиши /id прямо в нужном чате (бот должен быть там участником/
 // админом). Пригодится, чтобы вписать TIERn_ID в .env.
-bot.command(['id', 'chatid'], (ctx) =>
-  ctx.reply(`chat id: \`${ctx.chat.id}\`\nтип: ${ctx.chat.type}${ctx.chat.title ? `\n${ctx.chat.title}` : ''}`, { parse_mode: 'Markdown' })
-);
+bot.command(['id', 'chatid'], (ctx) => {
+  const title = ctx.chat.title ? `\nНазвание: ${ctx.chat.title.replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}` : '';
+  return ctx.reply(`🆔 ID этого чата: <code>${ctx.chat.id}</code>\nТип: ${ctx.chat.type}${title}`, { parse_mode: 'HTML' });
+});
 
 bot.command('help', (ctx) => {
   if (isAdmin(ctx.from)) {
-    return ctx.reply('Команды админа:\n• /admin — открыть панель\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой Telegram-аккаунт\n• /unbind <ID> — снять привязку ID (и выгнать из чатов)\n• /whoami — твой user_id\n\nОбновление подписчиков и списки — через меню /admin.');
+    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
   }
-  return ctx.reply('Напиши /start, чтобы зарегистрироваться, или /check — проверить доступ. Прислать нужно свой doTERRA ID (7–8 цифр).');
+  return ctx.reply('Я открываю доступ в чаты «Бережное врачевание» по баллам doTERRA.\n\n• /start — зарегистрироваться\n• /check — проверить свой доступ\n\nНужно прислать свой doTERRA ID (7–8 цифр).');
 });
 
 // ─────────────────────────────────────────────────────────────────────────
 //  АДМИНСКИЕ КОМАНДЫ
 // ─────────────────────────────────────────────────────────────────────────
 bot.command('rebind', async (ctx) => {
-  if (!isAdmin(ctx.from)) return ctx.reply('Команда доступна только администраторам.');
+  if (!isAdmin(ctx.from)) return ctx.reply('Эта команда только для администраторов.');
   const [doterraId, newUid] = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
   if (!/^\d{6,9}$/.test(doterraId || '') || !/^\d{5,}$/.test(newUid || '')) {
     return ctx.reply('Перепривязать:\n/rebind <doTERRA ID> <новый user_id>\nНапример: /rebind 18170008 123456789\nНовый user_id: пусть человек напишет боту /whoami.');
@@ -268,7 +268,7 @@ bot.command('rebind', async (ctx) => {
 });
 
 bot.command('unbind', async (ctx) => {
-  if (!isAdmin(ctx.from)) return ctx.reply('Команда доступна только администраторам.');
+  if (!isAdmin(ctx.from)) return ctx.reply('Эта команда только для администраторов.');
   const id = (ctx.match || '').trim();
   if (!/^\d{6,9}$/.test(id)) return ctx.reply('Освободить ID:\n/unbind <doTERRA ID>');
   const member = store.getMember(id);
@@ -293,7 +293,7 @@ bot.callbackQuery('adm_update', async (ctx) => {
   const kb = new InlineKeyboard();
   TIERS.forEach((t) => kb.text(`${t.name} (от ${t.threshold})`, `adm_tier:${t.key}`).row());
   kb.text('❌ Отмена', 'adm_cancel');
-  await ctx.reply('Какой чат обновляем? У каждого свой порог баллов.', { reply_markup: kb });
+  await ctx.reply('📋 Какой чат обновляем? У каждого свой порог баллов:', { reply_markup: kb });
 });
 
 bot.callbackQuery(/^adm_tier:(\w+)$/, async (ctx) => {
@@ -302,7 +302,7 @@ bot.callbackQuery(/^adm_tier:(\w+)$/, async (ctx) => {
   if (!tier) return ctx.reply('Чат не найден.', { reply_markup: mainMenu() });
   store.startImport(ctx.from.id, tier.key);
   await ctx.reply(
-    `Обновляем «${tier.name}» (порог ${tier.threshold}).\n📥 Пришли CSV из расширения. Если кабинета два — оба по очереди, потом «Посчитать».`,
+    `📊 Обновляем «${tier.name}» (порог ${tier.threshold} баллов).\n\n📥 Пришли CSV-файл из расширения. Если кабинета два — присылай оба по очереди, потом жми «Посчитать на вылет».`,
     { reply_markup: new InlineKeyboard().text('✅ Посчитать на вылет', 'adm_calc').text('❌ Отмена', 'adm_cancel') }
   );
 });
@@ -318,7 +318,7 @@ bot.callbackQuery('adm_list', async (ctx) => {
     const badge = inT.length ? `🟢${inT.join(',')}` : invT.length ? `🟡${invT.join(',')}` : '⚪️';
     return `${badge} ${m.name || '—'} · ${m.doterraId} · ${fmtPv(pv)}`;
   });
-  const head = `Участники (${members.length}) — 🟢N в чате N, 🟡N приглашён, ⚪️ ждёт:\n`;
+  const head = `👥 Участники (${members.length})\n🟢 — в чате · 🟡 — приглашён · ⚪️ — ждёт баллов\n\n`;
   let body = lines.join('\n');
   if ((head + body).length > 3800) body = lines.slice(0, 60).join('\n') + `\n… и ещё ${members.length - 60}`;
   await ctx.reply(head + body);
@@ -329,8 +329,7 @@ bot.callbackQuery('adm_status', async (ctx) => {
   await ctx.answerCallbackQuery();
   const perTier = TIERS.map((t) => `• ${t.name} (от ${t.threshold}): ${members.filter((m) => m.tiers?.[t.key] === 'in').length} в чате`).join('\n');
   await ctx.reply(
-    `Зарегистрировано: ${members.length}\n${perTier || '(чаты не настроены)'}\n` +
-      `Снимок баллов: ${Object.keys(store.getData().points).length} записей.`
+    `ℹ️ Статус\n\n👥 Зарегистрировано: ${members.length}\n${perTier || '(чаты не настроены)'}\n\n⭐️ Снимок баллов: ${Object.keys(store.getData().points).length} записей.`
   );
 });
 
@@ -409,7 +408,7 @@ bot.on('message:document', async (ctx) => {
     const inTier = store.listMembers().filter((m) => m.tiers?.[session.tier] === 'in');
     const missing = inTier.filter((m) => !(m.doterraId in sess.points));
     const warn = missing.length ? `\n⚠️ ${missing.length} из ${inTier.length} в чате нет в файле (возможно, второй кабинет). Пришли второй файл или жми «Посчитать» — их не тронем.` : '';
-    await ctx.reply(`«${tier?.name}»: файл принят, ${added} строк (файлов: ${sess.files.length}).${warn}`, {
+    await ctx.reply(`✅ «${tier?.name}»: файл принят — ${added} строк (файлов: ${sess.files.length}).${warn}`, {
       reply_markup: new InlineKeyboard().text('✅ Посчитать на вылет', 'adm_calc').text('❌ Отмена', 'adm_cancel'),
     });
   } catch (e) { await ctx.reply('Ошибка чтения файла: ' + e.message); }
@@ -425,11 +424,12 @@ bot.callbackQuery('adm_calc', async (ctx) => {
   let note = '';
   if (tier.id) {
     await ctx.reply('🔄 Проверяю, кто сейчас в чате…');
-    const { checked, inside } = await syncTierMembership(tier);
+    const { inside } = await syncTierMembership(tier);
     let total = null;
     try { total = await bot.api.getChatMemberCount(tier.id); } catch {}
-    note = `В чате всего: ${total ?? '?'}, из них привязано к боту: ${inside}.\n`;
-    if (total != null && total - 1 > inside) note += `⚠️ ${total - 1 - inside} чел. не зарегистрированы — их бот не видит и удалить не может (пусть напишут боту свой doTERRA ID).\n`;
+    note = `👥 В чате: ${total ?? '?'} · привязано к боту: ${inside}\n`;
+    if (total != null && total - 1 > inside) note += `⚠️ ${total - 1 - inside} чел. без привязки — их не проверить по баллам (пусть напишут боту свой doTERRA ID).\n\n`;
+    else note += '\n';
   }
 
   const pointsMap = new Map(Object.entries(session.points));
@@ -438,14 +438,17 @@ bot.callbackQuery('adm_calc', async (ctx) => {
   store.setReviewed(toRemove.map((m) => ({ doterraId: m.doterraId, userId: m.userId, pv: m.pv })));
 
   if (!toRemove.length) {
+    const body = inTier.length === 0
+      ? `«${tier.name}»: под удаление никто не попал — в чате нет ни одного привязанного участника.`
+      : `«${tier.name}»: удалять некого — все привязанные в чате набрали ${tier.threshold}+.`;
     await ctx.reply(
-      note + `«${tier.name}»: удалять некого — все привязанные в чате набрали ${tier.threshold}+.` + (missing.length ? `\n(${missing.length} без данных — не тронуты.)` : ''),
+      note + body + (missing.length ? `\n(${missing.length} без данных — не тронуты.)` : ''),
       { reply_markup: new InlineKeyboard().text('✅ Обновить баллы (без удаления)', 'adm_commit').text('❌ Отмена', 'adm_cancel') }
     );
     return;
   }
-  const list = toRemove.map((m, i) => `${i + 1}. ${m.name || '—'} · ${m.doterraId} · ${m.pv}`).join('\n');
-  const text = note + `❌ ИЗ «${tier.name}» НА ВЫЛЕТ (PV < ${tier.threshold}) — ${toRemove.length}:\n${list}` + (missing.length ? `\n\n⚠️ Без данных (не тронем): ${missing.length}` : '') + `\n\nПодтвердить удаление?`;
+  const list = toRemove.map((m, i) => `${i + 1}. ${m.name || '—'} · ${m.doterraId} · ${m.pv} б.`).join('\n');
+  const text = note + `❌ На вылет из «${tier.name}» — ${toRemove.length} (баллов < ${tier.threshold}):\n${list}` + (missing.length ? `\n\n⚠️ Без данных, не тронем: ${missing.length}` : '') + `\n\nПодтвердить удаление?`;
   await ctx.reply(text.length > 3800 ? text.slice(0, 3800) + '\n… (длинный список)' : text, {
     reply_markup: new InlineKeyboard().text(`🗑 Удалить ${toRemove.length}`, 'adm_confirm').text('❌ Отмена', 'adm_cancel'),
   });
@@ -461,7 +464,7 @@ async function reinviteTier(pointsMap, tier) {
       const link = await inviteLink(m, tier);
       if (link) {
         store.setTierState(m.doterraId, tier.key, 'invited');
-        try { await bot.api.sendMessage(m.userId, `Ты набрал баллы — доступ в «${tier.name}»:\n${link}`); } catch {}
+        try { await bot.api.sendMessage(m.userId, `🎉 Ты набрал нужные баллы! Открылся доступ в «${tier.name}»:\n${link}`); } catch {}
         invited++; await sleep(300);
       }
     }
@@ -480,7 +483,7 @@ bot.callbackQuery('adm_commit', async (ctx) => {
     if (pointsMap.size) store.commitPoints(pointsMap);
     const invited = await reinviteTier(pointsMap, tier);
     store.clearImport();
-    await ctx.reply(`«${tier.name}»: баллы обновлены, никого не удалял.\n✅ Приглашено (набрали порог): ${invited}`, { reply_markup: mainMenu() });
+    await ctx.reply(`✅ «${tier.name}»: баллы обновлены, никого не удаляли.\n🎉 Приглашено (набрали порог): ${invited}`, { reply_markup: mainMenu() });
   } catch (e) { console.error('adm_commit', e.message); await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() }); }
   finally { applying = false; }
 });
@@ -504,13 +507,13 @@ bot.callbackQuery('adm_confirm', async (ctx) => {
       if (banned) {
         store.setTierState(m.doterraId, tier.key, null);
         removed++;
-        try { await bot.api.sendMessage(m.userId, `Доступ в «${tier.name}» закрыт: ${pv} балл(ов), нужно ${tier.threshold}. Набери баллы и нажми /check.`); } catch {}
+        try { await bot.api.sendMessage(m.userId, `😔 Доступ в «${tier.name}» приостановлен.\n\nУ тебя ${pv}, а нужно ${tier.threshold} баллов. Наберёшь — нажми /check, и я снова открою.`); } catch {}
       }
       await sleep(350);
     }
     const invited = await reinviteTier(pointsMap, tier);
     store.clearImport();
-    let msg = `Готово по «${tier.name}».\n🗑 Удалено: ${removed}\n✅ Приглашено: ${invited}`;
+    let msg = `✅ Готово по «${tier.name}»:\n\n🗑 Удалено: ${removed}\n🎉 Приглашено: ${invited}`;
     if (skipped) msg += `\nℹ️ Пропущено (вышли/восстановились): ${skipped}`;
     await ctx.reply(msg, { reply_markup: mainMenu() });
   } catch (e) { console.error('adm_confirm', e.message); await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() }); }
@@ -545,7 +548,7 @@ bot.on('message:text', async (ctx) => {
   if (/^\d{6,9}$/.test(text)) {
     const owner = store.getMember(text);
     if (owner && owner.userId !== ctx.from.id) {
-      await ctx.reply(`⛔️ ID *${text}* уже привязан к другому Telegram-аккаунту.\nЕсли это ваш ID — напишите администратору.`, { parse_mode: 'Markdown' });
+      await ctx.reply(`⛔️ ID ${text} уже привязан к другому Telegram-аккаунту.\n\nЕсли это твой ID — напиши администратору, поможем.`);
       return;
     }
     const member = store.registerMember(text, ctx.from);
@@ -553,9 +556,9 @@ bot.on('message:text', async (ctx) => {
     return;
   }
   const flow = store.getFlow(ctx.from.id);
-  if (flow?.step === 'awaiting_id') { await ctx.reply('Пришли только цифры ID (обычно 7–8 цифр), например 18170008.'); return; }
+  if (flow?.step === 'awaiting_id') { await ctx.reply('Хм, это не похоже на ID 🤔\nПришли только цифры — обычно 7–8, например 18170008.'); return; }
   const member = store.findMemberByUser(ctx.from.id);
-  await ctx.reply(member ? 'Пришли ID (7–8 цифр), если хочешь исправить, или нажми /check.' : 'Напиши /start, чтобы зарегистрироваться.');
+  await ctx.reply(member ? 'Чтобы проверить доступ — нажми /check. Или пришли новый ID, если нужно исправить.' : 'Чтобы начать — нажми /start, я подскажу, что делать.');
 });
 
 // Фактический вход/выход в чате тира → источник правды членства.
