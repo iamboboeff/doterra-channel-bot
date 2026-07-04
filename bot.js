@@ -4,8 +4,16 @@ import { parseCSV, detectColumns, extractRecords } from './csv.js';
 import { classify } from './logic.js';
 import * as store from './store.js';
 
-const MEMBER_TOKEN = process.env.MEMBER_BOT_TOKEN;
-const ADMIN_TOKEN = process.env.ADMIN_BOT_TOKEN;
+// ─────────────────────────────────────────────────────────────────────────
+//  ОДИН БОТ НА ВСЁ
+//  Один Telegram-бот обслуживает и участников (регистрация по doTERRA ID,
+//  выдача ссылок в чаты), и администраторов (импорт CSV, чистка по баллам).
+//  Кто перед ботом — решает isAdmin(): админ видит панель, остальные — регистрацию.
+//  Этот же бот должен быть админом в чатах-тирах с правами «Пригласительные
+//  ссылки» и «Блокировка пользователей».
+// ─────────────────────────────────────────────────────────────────────────
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.MEMBER_BOT_TOKEN || process.env.ADMIN_BOT_TOKEN;
+if (!BOT_TOKEN) { console.error('Нужен BOT_TOKEN в .env'); process.exit(1); }
 
 // ── Чаты-тиры: TIER1_ID / TIER1_THRESHOLD / TIER1_NAME, TIER2_… и т.д. ──────
 // Тир = один чат со своим порогом баллов. id можно оставить пустым, пока чат не
@@ -36,24 +44,16 @@ const ADMIN_IDS = new Set(
 const ADMIN_USERNAMES = new Set(
   (process.env.ADMIN_USERNAMES || '').split(',').map((s) => s.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)
 );
-// Фолбэк-админы: первые N человек, написавших /start админ-боту, становятся
-// администраторами (на случай, если id/ник не заданы). 0 — выключить.
+// Фолбэк-админы на ПЕРВИЧНУЮ настройку: первые N человек, написавших /admin,
+// становятся администраторами. Работает ТОЛЬКО пока не задан ни один
+// ADMIN_IDS/ADMIN_USERNAMES — иначе (как сейчас) выключен, чтобы обычный
+// участник не мог случайно получить админку. 0 — выключить полностью.
 const MAX_AUTO_ADMINS = Number.isFinite(Number(process.env.MAX_AUTO_ADMINS)) ? Number(process.env.MAX_AUTO_ADMINS) : 5;
+const HAS_EXPLICIT_ADMINS = ADMIN_IDS.size > 0 || ADMIN_USERNAMES.size > 0;
 
-// ROLE: both | member | admin — какой бот активно опрашивает Telegram (для
-// раздельного деплоя двух записей). Токен «второго» бота всё равно указываем —
-// админ-бот шлёт участникам ссылки и уведомления через memberBot.api.
-const ROLE = (process.env.ROLE || 'both').toLowerCase();
-const wantMember = ROLE === 'member' || ROLE === 'both';
-const wantAdmin = ROLE === 'admin' || ROLE === 'both';
-
-if (!wantMember && !wantAdmin) { console.error(`Неверный ROLE="${ROLE}". Допустимо: member, admin, both.`); process.exit(1); }
-if (wantMember && !MEMBER_TOKEN) { console.error(`ROLE=${ROLE} требует MEMBER_BOT_TOKEN в .env`); process.exit(1); }
-if (wantAdmin && !ADMIN_TOKEN) { console.error(`ROLE=${ROLE} требует ADMIN_BOT_TOKEN в .env`); process.exit(1); }
 if (!TIERS.length) console.warn('⚠️  Не настроено ни одного чата (TIER1_NAME…). Бот не сможет приглашать/удалять.');
 
-const memberBot = MEMBER_TOKEN ? new Bot(MEMBER_TOKEN) : null;
-const adminBot = ADMIN_TOKEN ? new Bot(ADMIN_TOKEN) : null;
+const bot = new Bot(BOT_TOKEN);
 
 const isAdmin = (u) =>
   !!u && (ADMIN_IDS.has(u.id) || (u.username && ADMIN_USERNAMES.has(u.username.toLowerCase())) || store.getAutoAdmins().includes(u.id));
@@ -77,11 +77,11 @@ async function tgRetry(fn, tries = 4) {
 
 // Одноразовая ссылка (на сутки) в чат тира. Возвращает строку ссылки или null.
 async function inviteLink(member, tier) {
-  if (!memberBot || !tier.id) return null;
+  if (!tier.id) return null;
   const expire = Math.floor(Date.now() / 1000) + 24 * 3600;
   try {
     const link = await tgRetry(() =>
-      memberBot.api.createChatInviteLink(tier.id, { member_limit: 1, expire_date: expire, name: `reg ${member.doterraId} t${tier.key}` })
+      bot.api.createChatInviteLink(tier.id, { member_limit: 1, expire_date: expire, name: `reg ${member.doterraId} t${tier.key}` })
     );
     return link.invite_link;
   } catch (e) { console.error('Ссылка для', tier.name, e.message); return null; }
@@ -89,11 +89,11 @@ async function inviteLink(member, tier) {
 
 // Кик из конкретного чата: бан + сразу разбан (чтобы не копился ЧС).
 async function banFromTier(userId, tier) {
-  if (!adminBot || !tier.id) return { banned: false };
+  if (!tier.id) return { banned: false };
   let banned = false;
-  try { await tgRetry(() => adminBot.api.banChatMember(tier.id, userId)); banned = true; }
+  try { await tgRetry(() => bot.api.banChatMember(tier.id, userId)); banned = true; }
   catch (e) { console.error('Бан', tier.name, userId, e.message); }
-  try { await tgRetry(() => adminBot.api.unbanChatMember(tier.id, userId, { only_if_banned: true })); }
+  try { await tgRetry(() => bot.api.unbanChatMember(tier.id, userId, { only_if_banned: true })); }
   catch (e) { console.error('Разбан', tier.name, userId, e.message); }
   return { banned };
 }
@@ -143,61 +143,7 @@ async function evaluateAndReply(ctx, member) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  БОТ УЧАСТНИКОВ
-// ─────────────────────────────────────────────────────────────────────────
-if (memberBot) {
-memberBot.command('start', async (ctx) => {
-  const existing = store.findMemberByUser(ctx.from.id);
-  if (existing) {
-    const pv = store.getPoints(existing.doterraId);
-    await ctx.reply(`Ты уже зарегистрирован.\nID: ${existing.doterraId}\nБаллы: ${fmtPv(pv)}\n\nНажми /check для проверки доступа, или пришли другой ID, если ошибся.`);
-    return;
-  }
-  store.setFlow(ctx.from.id, 'awaiting_id');
-  await ctx.reply(`Привет! 👋\nПришли свой *ID участника doTERRA* (номер из кабинета, обычно 7–8 цифр).\nНапример: 18170008`, { parse_mode: 'Markdown' });
-});
-
-memberBot.command('check', async (ctx) => {
-  const member = store.findMemberByUser(ctx.from.id);
-  if (!member) { store.setFlow(ctx.from.id, 'awaiting_id'); await ctx.reply('Ты ещё не зарегистрирован. Пришли свой ID doTERRA (7–8 цифр).'); return; }
-  await evaluateAndReply(ctx, member);
-});
-
-memberBot.command('whoami', (ctx) => ctx.reply(`Твой user_id: ${ctx.from.id}`));
-
-memberBot.on('message:text', async (ctx) => {
-  const text = ctx.message.text.trim();
-  if (/^\d{6,9}$/.test(text)) {
-    const owner = store.getMember(text);
-    if (owner && owner.userId !== ctx.from.id) {
-      await ctx.reply(`⛔️ ID *${text}* уже привязан к другому Telegram-аккаунту.\nЕсли это ваш ID — напишите администратору.`, { parse_mode: 'Markdown' });
-      return;
-    }
-    const member = store.registerMember(text, ctx.from);
-    await evaluateAndReply(ctx, member);
-    return;
-  }
-  const flow = store.getFlow(ctx.from.id);
-  if (flow?.step === 'awaiting_id') { await ctx.reply('Пришли только цифры ID (обычно 7–8 цифр), например 18170008.'); return; }
-  const member = store.findMemberByUser(ctx.from.id);
-  await ctx.reply(member ? 'Пришли ID (7–8 цифр), если хочешь исправить, или нажми /check.' : 'Напиши /start, чтобы зарегистрироваться.');
-});
-
-// Фактический вход/выход в чате тира → источник правды членства.
-memberBot.on('chat_member', (ctx) => {
-  const t = tierByChat(ctx.chat?.id);
-  if (!t) return;
-  const uid = ctx.chatMember.new_chat_member?.user?.id;
-  const status = ctx.chatMember.new_chat_member?.status;
-  const member = uid && store.findMemberByUser(uid);
-  if (!member) return;
-  const inside = status === 'member' || status === 'administrator' || status === 'creator';
-  store.setTierState(member.doterraId, t.key, inside ? 'in' : null);
-});
-} // if (memberBot)
-
-// ─────────────────────────────────────────────────────────────────────────
-//  АДМИН-БОТ
+//  ОБЩИЕ КОМАНДЫ (роль определяется по isAdmin)
 // ─────────────────────────────────────────────────────────────────────────
 function mainMenu() {
   return new InlineKeyboard()
@@ -206,34 +152,58 @@ function mainMenu() {
     .text('🔗 Отвязать участника', 'adm_unbind_start').row()
     .text('ℹ️ Статус', 'adm_status');
 }
+const showAdminPanel = (ctx) =>
+  ctx.reply('Админ-панель doTERRA. Выбери действие ниже.\nЕщё команды — /help.', { reply_markup: mainMenu() });
 
-if (adminBot) {
-adminBot.use(async (ctx, next) => {
-  if (ctx.from && !isAdmin(ctx.from)) {
-    // Фолбэк: первые MAX_AUTO_ADMINS, написавшие /start, становятся админами.
-    const isStart = ctx.message?.text?.trim().startsWith('/start');
-    if (isStart && MAX_AUTO_ADMINS > 0 && store.getAutoAdmins().length < MAX_AUTO_ADMINS) {
-      store.addAutoAdmin(ctx.from.id);
-      await ctx.reply('✅ Ты добавлен как администратор (по фолбэку «первые запустившие»).');
-    } else {
-      if (ctx.callbackQuery) await ctx.answerCallbackQuery('Только для администратора.');
-      else await ctx.reply(`Этот бот только для администратора. Твой user_id: ${ctx.from.id}`);
-      return;
-    }
+// /start — админ сразу попадает в панель, остальные регистрируются.
+bot.command('start', async (ctx) => {
+  if (isAdmin(ctx.from)) return showAdminPanel(ctx);
+  const existing = store.findMemberByUser(ctx.from.id);
+  if (existing) {
+    const pv = store.getPoints(existing.doterraId);
+    await ctx.reply(`Ты уже зарегистрирован.\nID: ${existing.doterraId}\nБаллы: ${fmtPv(pv)}\n\nНажми /check для проверки доступа, или пришли другой ID, если ошибся.`);
+    return;
   }
-  await next();
+  store.setFlow(ctx.from.id, 'awaiting_id');
+  await ctx.reply(`Привет! 👋\nЧтобы попасть в чат «Бережное врачевание», напиши тут свой *ID участника doTERRA* — это номер из кабинета (обычно 7–8 цифр).\nНапример: 18170008`, { parse_mode: 'Markdown' });
 });
 
-adminBot.command('whoami', (ctx) => ctx.reply(`Твой user_id: ${ctx.from.id}`));
-adminBot.command('start', (ctx) => ctx.reply('Админ-панель doTERRA. Выбери действие ниже.\nЕщё команды — /help.', { reply_markup: mainMenu() }));
-adminBot.command('help', (ctx) =>
-  ctx.reply('Команды админа:\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой Telegram-аккаунт\n• /unbind <ID> — снять привязку ID (и выгнать из чатов)\n• /whoami — твой user_id\n\nОбновление подписчиков и списки — через меню /start.')
-);
+// /admin — явный вход в панель. Для не-админа работает только как первичная
+// настройка (если админы ещё нигде не заданы), иначе просто отказ.
+bot.command('admin', async (ctx) => {
+  if (isAdmin(ctx.from)) return showAdminPanel(ctx);
+  if (!HAS_EXPLICIT_ADMINS && MAX_AUTO_ADMINS > 0 && store.getAutoAdmins().length < MAX_AUTO_ADMINS) {
+    store.addAutoAdmin(ctx.from.id);
+    await ctx.reply('✅ Ты добавлен как администратор (первичная настройка).');
+    return showAdminPanel(ctx);
+  }
+  await ctx.reply('Команда доступна только администраторам.');
+});
 
-adminBot.command('rebind', async (ctx) => {
+// /check — проверка своего доступа (для участников).
+bot.command('check', async (ctx) => {
+  const member = store.findMemberByUser(ctx.from.id);
+  if (!member) { store.setFlow(ctx.from.id, 'awaiting_id'); await ctx.reply('Ты ещё не зарегистрирован. Пришли свой ID doTERRA (7–8 цифр).'); return; }
+  await evaluateAndReply(ctx, member);
+});
+
+bot.command('whoami', (ctx) => ctx.reply(`Твой user_id: ${ctx.from.id}`));
+
+bot.command('help', (ctx) => {
+  if (isAdmin(ctx.from)) {
+    return ctx.reply('Команды админа:\n• /admin — открыть панель\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой Telegram-аккаунт\n• /unbind <ID> — снять привязку ID (и выгнать из чатов)\n• /whoami — твой user_id\n\nОбновление подписчиков и списки — через меню /admin.');
+  }
+  return ctx.reply('Напиши /start, чтобы зарегистрироваться, или /check — проверить доступ. Прислать нужно свой doTERRA ID (7–8 цифр).');
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+//  АДМИНСКИЕ КОМАНДЫ
+// ─────────────────────────────────────────────────────────────────────────
+bot.command('rebind', async (ctx) => {
+  if (!isAdmin(ctx.from)) return ctx.reply('Команда доступна только администраторам.');
   const [doterraId, newUid] = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
   if (!/^\d{6,9}$/.test(doterraId || '') || !/^\d{5,}$/.test(newUid || '')) {
-    return ctx.reply('Перепривязать:\n/rebind <doTERRA ID> <новый user_id>\nНапример: /rebind 18170008 123456789\nНовый user_id: пусть человек напишет боту-участников /whoami.');
+    return ctx.reply('Перепривязать:\n/rebind <doTERRA ID> <новый user_id>\nНапример: /rebind 18170008 123456789\nНовый user_id: пусть человек напишет боту /whoami.');
   }
   const member = store.getMember(doterraId);
   if (!member) return ctx.reply(`ID ${doterraId} ещё никем не занят — привязывать нечего.`);
@@ -242,10 +212,11 @@ adminBot.command('rebind', async (ctx) => {
   if (conflict && conflict.doterraId !== doterraId) return ctx.reply(`У аккаунта ${newUid} уже привязан ID ${conflict.doterraId}. Сначала /unbind ${conflict.doterraId}`);
   if (member.userId && member.userId !== newUidNum) await kickFromAllTiers(member);
   store.rebindMember(doterraId, newUidNum);
-  await ctx.reply(`✅ ID ${doterraId} перепривязан на аккаунт ${newUid}. Прежний доступ отозван. Пусть новый аккаунт напишет боту-участников /check.`);
+  await ctx.reply(`✅ ID ${doterraId} перепривязан на аккаунт ${newUid}. Прежний доступ отозван. Пусть новый аккаунт напишет боту /check.`);
 });
 
-adminBot.command('unbind', async (ctx) => {
+bot.command('unbind', async (ctx) => {
+  if (!isAdmin(ctx.from)) return ctx.reply('Команда доступна только администраторам.');
   const id = (ctx.match || '').trim();
   if (!/^\d{6,9}$/.test(id)) return ctx.reply('Освободить ID:\n/unbind <doTERRA ID>');
   const member = store.getMember(id);
@@ -255,8 +226,16 @@ adminBot.command('unbind', async (ctx) => {
   await ctx.reply(`✅ ID ${id} освобождён, доступ во все чаты отозван.`);
 });
 
+// Единый страж для всех админских инлайн-кнопок (adm_*): не-админа не пускаем.
+bot.on('callback_query:data', async (ctx, next) => {
+  if (ctx.callbackQuery.data.startsWith('adm_') && !isAdmin(ctx.from)) {
+    return ctx.answerCallbackQuery('Только для администратора.');
+  }
+  await next();
+});
+
 // «Обновить подписчиков» → выбор чата (тира)
-adminBot.callbackQuery('adm_update', async (ctx) => {
+bot.callbackQuery('adm_update', async (ctx) => {
   await ctx.answerCallbackQuery();
   if (!TIERS.length) return ctx.reply('Чаты не настроены (TIER1_NAME… в .env).', { reply_markup: mainMenu() });
   const kb = new InlineKeyboard();
@@ -265,7 +244,7 @@ adminBot.callbackQuery('adm_update', async (ctx) => {
   await ctx.reply('Какой чат обновляем? У каждого свой порог баллов.', { reply_markup: kb });
 });
 
-adminBot.callbackQuery(/^adm_tier:(\w+)$/, async (ctx) => {
+bot.callbackQuery(/^adm_tier:(\w+)$/, async (ctx) => {
   const tier = tierByKey(ctx.match[1]);
   await ctx.answerCallbackQuery();
   if (!tier) return ctx.reply('Чат не найден.', { reply_markup: mainMenu() });
@@ -276,7 +255,7 @@ adminBot.callbackQuery(/^adm_tier:(\w+)$/, async (ctx) => {
   );
 });
 
-adminBot.callbackQuery('adm_list', async (ctx) => {
+bot.callbackQuery('adm_list', async (ctx) => {
   const members = store.listMembers();
   await ctx.answerCallbackQuery();
   if (!members.length) return ctx.reply('Пока никто не зарегистрирован.');
@@ -293,7 +272,7 @@ adminBot.callbackQuery('adm_list', async (ctx) => {
   await ctx.reply(head + body);
 });
 
-adminBot.callbackQuery('adm_status', async (ctx) => {
+bot.callbackQuery('adm_status', async (ctx) => {
   const members = store.listMembers();
   await ctx.answerCallbackQuery();
   const perTier = TIERS.map((t) => `• ${t.name} (от ${t.threshold}): ${members.filter((m) => m.tiers?.[t.key] === 'in').length} в чате`).join('\n');
@@ -303,24 +282,24 @@ adminBot.callbackQuery('adm_status', async (ctx) => {
   );
 });
 
-adminBot.callbackQuery('adm_cancel', async (ctx) => {
+bot.callbackQuery('adm_cancel', async (ctx) => {
   store.clearImport();
   await ctx.answerCallbackQuery('Отменено');
   await ctx.reply('Отменено.', { reply_markup: mainMenu() });
 });
 
 // ── Отвязка участника кнопкой ──
-adminBot.callbackQuery('adm_unbind_start', async (ctx) => {
+bot.callbackQuery('adm_unbind_start', async (ctx) => {
   adminState.set(ctx.from.id, { step: 'await_unbind_id' });
   await ctx.answerCallbackQuery();
   await ctx.reply('Введите ID doTERRA участника:', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') });
 });
-adminBot.callbackQuery('adm_back', async (ctx) => {
+bot.callbackQuery('adm_back', async (ctx) => {
   adminState.delete(ctx.from.id);
   await ctx.answerCallbackQuery();
   await ctx.reply('Меню:', { reply_markup: mainMenu() });
 });
-adminBot.callbackQuery(/^adm_do_unbind:(\d{6,9})$/, async (ctx) => {
+bot.callbackQuery(/^adm_do_unbind:(\d{6,9})$/, async (ctx) => {
   const id = ctx.match[1];
   await ctx.answerCallbackQuery();
   const m = store.getMember(id);
@@ -330,31 +309,15 @@ adminBot.callbackQuery(/^adm_do_unbind:(\d{6,9})$/, async (ctx) => {
   await ctx.reply(`✅ Аккаунт отвязан от ID ${id}, доступ во все чаты отозван.`, { reply_markup: mainMenu() });
 });
 
-adminBot.on('message:text', async (ctx) => {
-  const st = adminState.get(ctx.from.id);
-  if (st?.step !== 'await_unbind_id') return;
-  const id = ctx.message.text.trim();
-  if (!/^\d{6,9}$/.test(id)) { await ctx.reply('Нужен номер ID (6–9 цифр). Или «Назад».', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') }); return; }
-  adminState.delete(ctx.from.id);
-  const m = store.getMember(id);
-  if (!m) { await ctx.reply(`ID ${id} ни к кому не привязан.`, { reply_markup: mainMenu() }); return; }
-  const tg = m.username ? '@' + m.username : '(без username)';
-  const inT = TIERS.filter((t) => m.tiers?.[t.key] === 'in').map((t) => t.name).join(', ') || '—';
-  const pv = store.getPoints(id);
-  await ctx.reply(
-    `🔗 Привязка ID ${id}\nИмя: ${m.name || '—'}\nTelegram: ${tg}\nuser_id: ${m.userId}\nБаллы: ${fmtPv(pv)}\nВ чатах: ${inT}`,
-    { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back').text('🔓 Отвязать', `adm_do_unbind:${id}`) }
-  );
-});
-
-// Приём CSV
-adminBot.on('message:document', async (ctx) => {
+// Приём CSV (только админ; файл качаем токеном этого же бота)
+bot.on('message:document', async (ctx) => {
+  if (!isAdmin(ctx.from)) return;
   const session = store.getImport();
   if (!session || !session.tier) { await ctx.reply('Сначала «📥 Обновить подписчиков» и выбери чат.', { reply_markup: mainMenu() }); return; }
   const tier = tierByKey(session.tier);
   try {
     const file = await ctx.getFile();
-    const resp = await fetch(`https://api.telegram.org/file/bot${ADMIN_TOKEN}/${file.file_path}`);
+    const resp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     if (Number(resp.headers.get('content-length') || 0) > 5_000_000) throw new Error('файл слишком большой');
     const rows = parseCSV(await resp.text());
@@ -371,7 +334,7 @@ adminBot.on('message:document', async (ctx) => {
   } catch (e) { await ctx.reply('Ошибка чтения файла: ' + e.message); }
 });
 
-adminBot.callbackQuery('adm_calc', async (ctx) => {
+bot.callbackQuery('adm_calc', async (ctx) => {
   const session = store.getImport();
   await ctx.answerCallbackQuery();
   const tier = tierByKey(session?.tier);
@@ -405,7 +368,7 @@ async function reinviteTier(pointsMap, tier) {
       const link = await inviteLink(m, tier);
       if (link) {
         store.setTierState(m.doterraId, tier.key, 'invited');
-        if (memberBot) { try { await memberBot.api.sendMessage(m.userId, `Ты набрал баллы — доступ в «${tier.name}»:\n${link}`); } catch {} }
+        try { await bot.api.sendMessage(m.userId, `Ты набрал баллы — доступ в «${tier.name}»:\n${link}`); } catch {}
         invited++; await sleep(300);
       }
     }
@@ -413,7 +376,7 @@ async function reinviteTier(pointsMap, tier) {
   return invited;
 }
 
-adminBot.callbackQuery('adm_commit', async (ctx) => {
+bot.callbackQuery('adm_commit', async (ctx) => {
   const session = store.getImport();
   const tier = tierByKey(session?.tier);
   if (!session || !session.files.length || !tier) { await ctx.answerCallbackQuery('Нет данных.'); return ctx.reply('Нет активного импорта.', { reply_markup: mainMenu() }); }
@@ -429,7 +392,7 @@ adminBot.callbackQuery('adm_commit', async (ctx) => {
   finally { applying = false; }
 });
 
-adminBot.callbackQuery('adm_confirm', async (ctx) => {
+bot.callbackQuery('adm_confirm', async (ctx) => {
   const session = store.getImport();
   const tier = tierByKey(session?.tier);
   if (!session || !session.reviewed || !tier) { await ctx.answerCallbackQuery('Сначала «Посчитать».'); return ctx.reply('Сначала «Посчитать», потом подтверждай.', { reply_markup: mainMenu() }); }
@@ -448,7 +411,7 @@ adminBot.callbackQuery('adm_confirm', async (ctx) => {
       if (banned) {
         store.setTierState(m.doterraId, tier.key, null);
         removed++;
-        if (memberBot) { try { await memberBot.api.sendMessage(m.userId, `Доступ в «${tier.name}» закрыт: ${pv} балл(ов), нужно ${tier.threshold}. Набери баллы и нажми /check.`); } catch {} }
+        try { await bot.api.sendMessage(m.userId, `Доступ в «${tier.name}» закрыт: ${pv} балл(ов), нужно ${tier.threshold}. Набери баллы и нажми /check.`); } catch {}
       }
       await sleep(350);
     }
@@ -460,11 +423,62 @@ adminBot.callbackQuery('adm_confirm', async (ctx) => {
   } catch (e) { console.error('adm_confirm', e.message); await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() }); }
   finally { applying = false; }
 });
-} // if (adminBot)
 
 // ─────────────────────────────────────────────────────────────────────────
-if (memberBot) memberBot.catch((err) => console.error('memberBot:', err.error?.message || err.message));
-if (adminBot) adminBot.catch((err) => console.error('adminBot:', err.error?.message || err.message));
+//  ТЕКСТ И СОБЫТИЯ ЧАТА
+// ─────────────────────────────────────────────────────────────────────────
+bot.on('message:text', async (ctx) => {
+  // 1) Админ вводит ID для отвязки — этот шаг в приоритете.
+  const st = adminState.get(ctx.from.id);
+  if (isAdmin(ctx.from) && st?.step === 'await_unbind_id') {
+    const id = ctx.message.text.trim();
+    if (!/^\d{6,9}$/.test(id)) { await ctx.reply('Нужен номер ID (6–9 цифр). Или «Назад».', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') }); return; }
+    adminState.delete(ctx.from.id);
+    const m = store.getMember(id);
+    if (!m) { await ctx.reply(`ID ${id} ни к кому не привязан.`, { reply_markup: mainMenu() }); return; }
+    const tg = m.username ? '@' + m.username : '(без username)';
+    const inT = TIERS.filter((t) => m.tiers?.[t.key] === 'in').map((t) => t.name).join(', ') || '—';
+    const pv = store.getPoints(id);
+    await ctx.reply(
+      `🔗 Привязка ID ${id}\nИмя: ${m.name || '—'}\nTelegram: ${tg}\nuser_id: ${m.userId}\nБаллы: ${fmtPv(pv)}\nВ чатах: ${inT}`,
+      { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back').text('🔓 Отвязать', `adm_do_unbind:${id}`) }
+    );
+    return;
+  }
 
-if (memberBot && wantMember) memberBot.start({ allowed_updates: ['message', 'callback_query', 'chat_member'], onStart: () => console.log('✓ Бот участников запущен') });
-if (adminBot && wantAdmin) adminBot.start({ allowed_updates: ['message', 'callback_query'], onStart: () => console.log('✓ Админ-бот запущен') });
+  // 2) Обычный поток участника: приём doTERRA ID.
+  const text = ctx.message.text.trim();
+  if (/^\d{6,9}$/.test(text)) {
+    const owner = store.getMember(text);
+    if (owner && owner.userId !== ctx.from.id) {
+      await ctx.reply(`⛔️ ID *${text}* уже привязан к другому Telegram-аккаунту.\nЕсли это ваш ID — напишите администратору.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    const member = store.registerMember(text, ctx.from);
+    await evaluateAndReply(ctx, member);
+    return;
+  }
+  const flow = store.getFlow(ctx.from.id);
+  if (flow?.step === 'awaiting_id') { await ctx.reply('Пришли только цифры ID (обычно 7–8 цифр), например 18170008.'); return; }
+  const member = store.findMemberByUser(ctx.from.id);
+  await ctx.reply(member ? 'Пришли ID (7–8 цифр), если хочешь исправить, или нажми /check.' : 'Напиши /start, чтобы зарегистрироваться.');
+});
+
+// Фактический вход/выход в чате тира → источник правды членства.
+bot.on('chat_member', (ctx) => {
+  const t = tierByChat(ctx.chat?.id);
+  if (!t) return;
+  const uid = ctx.chatMember.new_chat_member?.user?.id;
+  const status = ctx.chatMember.new_chat_member?.status;
+  const member = uid && store.findMemberByUser(uid);
+  if (!member) return;
+  const inside = status === 'member' || status === 'administrator' || status === 'creator';
+  store.setTierState(member.doterraId, t.key, inside ? 'in' : null);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+bot.catch((err) => console.error('bot:', err.error?.message || err.message));
+bot.start({
+  allowed_updates: ['message', 'callback_query', 'chat_member'],
+  onStart: () => console.log('✓ Бот запущен (участники + админка в одном)'),
+});
