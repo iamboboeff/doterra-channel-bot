@@ -182,6 +182,7 @@ function mainMenu() {
   return new InlineKeyboard()
     .text('📥 Обновить подписчиков', 'adm_update').row()
     .text('📋 Список участников', 'adm_list').row()
+    .text('👀 Кто не зарегистрирован', 'adm_unreg').row()
     .text('🔗 Отвязать участника', 'adm_unbind_start').row()
     .text('ℹ️ Статус', 'adm_status');
 }
@@ -192,7 +193,8 @@ const showAdminPanel = (ctx) =>
 // чате-тире — значит он реально там; помечаем 'in'. Сообщение не перехватываем.
 bot.on('message', async (ctx, next) => {
   const t = tierByChat(ctx.chat?.id);
-  if (t && ctx.from) {
+  if (t && ctx.from && !ctx.from.is_bot) {
+    store.recordSeen(ctx.from, t.key); // запоминаем, кого видели в чате (для поиска незарег.)
     const m = store.findMemberByUser(ctx.from.id);
     if (m && m.tiers?.[t.key] !== 'in') store.setTierState(m.doterraId, t.key, 'in');
   }
@@ -336,6 +338,35 @@ bot.callbackQuery('adm_cancel', async (ctx) => {
   store.clearImport();
   await ctx.answerCallbackQuery('Отменено');
   await ctx.reply('Отменено.', { reply_markup: mainMenu() });
+});
+
+// Кто в чатах НЕ зарегистрирован: из тех, кого бот видел (писал/входил) + админы
+// чата. Полного списка участников Telegram боту не даёт — молчунов тут не будет.
+bot.callbackQuery('adm_unreg', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const seen = store.listSeen();
+  const blocks = [];
+  for (const t of TIERS) {
+    if (!t.id) continue;
+    const rows = new Map(); // userId -> строка (чтобы не дублировать)
+    for (const s of seen) {
+      if (!s.tiers?.[t.key]) continue;
+      if (store.findMemberByUser(s.userId)) continue;         // уже привязан
+      if (isAdmin({ id: s.userId, username: s.username })) continue; // это управляющий бота
+      rows.set(s.userId, `• ${s.name || '—'}${s.username ? ' @' + s.username : ''} · id ${s.userId}`);
+    }
+    try {
+      for (const a of await bot.api.getChatAdministrators(t.id)) {
+        const u = a.user;
+        if (u.is_bot || rows.has(u.id) || store.findMemberByUser(u.id) || isAdmin({ id: u.id, username: u.username })) continue;
+        rows.set(u.id, `• ${[u.first_name, u.last_name].filter(Boolean).join(' ') || '—'}${u.username ? ' @' + u.username : ''} · id ${u.id} (админ чата)`);
+      }
+    } catch {}
+    blocks.push(`«${t.name}» — не зарегистрированы (${rows.size}):\n${[...rows.values()].join('\n') || '—'}`);
+  }
+  const text = (blocks.join('\n\n') || 'Чаты не настроены.') +
+    '\n\nℹ️ Видны только те, кто писал/входил при боте или является админом чата. Молчунов Telegram не показывает.';
+  await ctx.reply(text.length > 3900 ? text.slice(0, 3900) + '\n…' : text, { reply_markup: mainMenu() });
 });
 
 // ── Отвязка участника кнопкой ──
@@ -531,11 +562,12 @@ bot.on('message:text', async (ctx) => {
 bot.on('chat_member', (ctx) => {
   const t = tierByChat(ctx.chat?.id);
   if (!t) return;
-  const uid = ctx.chatMember.new_chat_member?.user?.id;
+  const user = ctx.chatMember.new_chat_member?.user;
   const status = ctx.chatMember.new_chat_member?.status;
-  const member = uid && store.findMemberByUser(uid);
-  if (!member) return;
   const inside = status === 'member' || status === 'administrator' || status === 'creator';
+  if (user && inside) store.recordSeen(user, t.key); // вошедшего тоже запоминаем
+  const member = user && store.findMemberByUser(user.id);
+  if (!member) return;
   store.setTierState(member.doterraId, t.key, inside ? 'in' : null);
 });
 

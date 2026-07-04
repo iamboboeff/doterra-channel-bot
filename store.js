@@ -20,6 +20,7 @@ const EMPTY = {
   flows: {}, // userId -> { step }
   import: null, // { tier, points:{id:pv}, files:[], by, reviewed:[] }
   admins: [], // userId[] — авто-админы (первые N, написавшие /start админ-боту)
+  seen: {}, // userId -> { userId, name, username, tiers:{tierKey:lastISO} } — кого бот видел в чатах
 };
 
 function db() {
@@ -39,6 +40,24 @@ function persist(data) {
 
 export function getData() { return db(); }
 export function save() {}
+
+// ── «Замеченные» в чатах ────────────────────────────────────────────────
+// Кого бот видел писавшим/входившим в чате тира — чтобы находить среди них
+// незарегистрированных (у кого нет привязки doTERRA ID). Ботов не пишем.
+export function recordSeen(user, tierKey) {
+  if (!user?.id || user.is_bot) return;
+  const data = db();
+  if (!data.seen) data.seen = {};
+  const cur = data.seen[user.id] || { userId: user.id, tiers: {} };
+  cur.name = [user.first_name, user.last_name].filter(Boolean).join(' ') || cur.name || '';
+  cur.username = user.username || cur.username || null;
+  if (!cur.tiers) cur.tiers = {};
+  cur.tiers[tierKey] = new Date().toISOString();
+  data.seen[user.id] = cur;
+  persist(data);
+}
+
+export function listSeen() { return Object.values(db().seen || {}); }
 
 // ── авто-админы (фолбэк: первые N, написавшие /start админ-боту) ────────────
 export function getAutoAdmins() { return db().admins || []; }
