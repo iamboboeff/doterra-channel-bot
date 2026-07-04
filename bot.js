@@ -361,10 +361,17 @@ bot.callbackQuery('adm_unreg', async (ctx) => {
         rows.set(u.id, `• ${[u.first_name, u.last_name].filter(Boolean).join(' ') || '—'}${u.username ? ' @' + u.username : ''} · id ${u.id} (админ чата)`);
       }
     } catch {}
-    blocks.push(`«${t.name}» — не зарегистрированы (${rows.size}):\n${[...rows.values()].join('\n') || '—'}`);
+    let total = null;
+    try { total = await bot.api.getChatMemberCount(t.id); } catch {}
+    const registeredIn = store.listMembers().filter((m) => m.tiers?.[t.key] === 'in').length;
+    const unlinked = total != null ? Math.max(0, total - 1 - registeredIn) : null; // всего без привязки (кроме бота)
+    const silent = unlinked != null ? Math.max(0, unlinked - rows.size) : null;      // из них молчуны
+    const head = `«${t.name}» — в чате ${total ?? '?'}` + (unlinked != null ? `, без привязки ~${unlinked}` : '');
+    const seenLine = `👀 Знаю по имени — ${rows.size}` + (silent ? ` (ещё ~${silent} молчат, их не видно)` : '') + ':';
+    blocks.push(`${head}\n${seenLine}\n${[...rows.values()].join('\n') || '—'}`);
   }
   const text = (blocks.join('\n\n') || 'Чаты не настроены.') +
-    '\n\nℹ️ Видны только те, кто писал/входил при боте или является админом чата. Молчунов Telegram не показывает.';
+    '\n\nℹ️ По именам видны только те, кто писал/входил при боте или админы. Чтобы «вытащить» молчунов — попроси всех что-нибудь написать в чате.';
   await ctx.reply(text.length > 3900 ? text.slice(0, 3900) + '\n…' : text, { reply_markup: mainMenu() });
 });
 
