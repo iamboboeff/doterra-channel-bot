@@ -195,6 +195,22 @@ function mainMenu() {
     .text('🔗 Отвязать участника', 'adm_unbind_start').row()
     .text('ℹ️ Статус', 'adm_status');
 }
+
+// Кнопки под результатом «Посчитать»: удалить / пригласить / и то и то —
+// показываем только применимые (по числу на вылет и на приглашение).
+function applyKeyboard(nRemove, nInvite) {
+  const kb = new InlineKeyboard();
+  if (nRemove && nInvite) {
+    return kb
+      .text(`🗑 Только удалить (${nRemove})`, 'adm_del').row()
+      .text(`➕ Только пригласить (${nInvite})`, 'adm_inv').row()
+      .text('🗑➕ Удалить и пригласить', 'adm_both').row()
+      .text('❌ Отмена', 'adm_cancel');
+  }
+  if (nRemove) return kb.text(`🗑 Удалить (${nRemove})`, 'adm_del').row().text('❌ Отмена', 'adm_cancel');
+  if (nInvite) return kb.text(`➕ Пригласить (${nInvite})`, 'adm_inv').row().text('❌ Отмена', 'adm_cancel');
+  return kb.text('✅ Обновить баллы', 'adm_inv').row().text('❌ Отмена', 'adm_cancel');
+}
 const showAdminPanel = (ctx) =>
   ctx.reply('🛠 Админ-панель doTERRA\n\nВыбери действие кнопкой ниже. Другие команды — /help.', { reply_markup: mainMenu() });
 
@@ -474,25 +490,24 @@ bot.callbackQuery('adm_calc', async (ctx) => {
     ? `\n\n➕ Пригласим — ${toInvite.length}:\n` + renderPeople(toInvite, (m, i) => `${i + 1}. ${plainName(m)} · ${pointsMap.get(m.doterraId)} б.`)
     : '';
 
-  const kbRemove = new InlineKeyboard().text(`🗑 Удалить ${toRemove.length}`, 'adm_confirm').text('❌ Отмена', 'adm_cancel');
-  const kbKeep = new InlineKeyboard().text('✅ Обновить баллы + пригласить', 'adm_commit').text('❌ Отмена', 'adm_cancel');
+  const kb = applyKeyboard(toRemove.length, toInvite.length);
 
   if (!toRemove.length) {
     const body = inTier.length === 0
       ? `«${escHtml(tier.name)}»: под удаление никто не попал — в чате нет ни одного привязанного участника.`
       : `«${escHtml(tier.name)}»: удалять некого — все привязанные в чате набрали ${tier.threshold}+.`;
     const tail = missing.length ? `\n(${missing.length} без данных — не тронуты.)` : '';
-    try { await ctx.reply(note + body + tail + inviteHtml, { parse_mode: 'HTML', reply_markup: kbKeep }); }
-    catch (e) { console.error('adm_calc', e.message); await ctx.reply((note + body + tail + invitePlain).slice(0, 4000), { reply_markup: kbKeep }); }
+    try { await ctx.reply(note + body + tail + inviteHtml, { parse_mode: 'HTML', reply_markup: kb }); }
+    catch (e) { console.error('adm_calc', e.message); await ctx.reply((note + body + tail + invitePlain).slice(0, 4000), { reply_markup: kb }); }
     return;
   }
   const missTail = missing.length ? `\n\n⚠️ Без данных, не тронем: ${missing.length}` : '';
   const listHtml = renderPeople(toRemove, (m, i) => `${i + 1}. ${mention(m.userId, m.name)}${m.username ? ' @' + escHtml(m.username) : ''} · ${m.pv} б.`);
   const listPlain = renderPeople(toRemove, (m, i) => `${i + 1}. ${plainName(m)} · ${m.pv} б.`);
-  const html = note + `❌ <b>На вылет</b> из «${escHtml(tier.name)}» — ${toRemove.length} (баллов &lt; ${tier.threshold}):\n${listHtml}` + missTail + inviteHtml + `\n\nПодтвердить удаление?`;
-  const plain = note + `❌ На вылет из «${tier.name}» — ${toRemove.length} (баллов < ${tier.threshold}):\n${listPlain}` + missTail + invitePlain + `\n\nПодтвердить удаление?`;
-  try { await ctx.reply(html, { parse_mode: 'HTML', reply_markup: kbRemove }); }
-  catch (e) { console.error('adm_calc', e.message); await ctx.reply(plain.slice(0, 4000), { reply_markup: kbRemove }); }
+  const html = note + `❌ <b>На вылет</b> из «${escHtml(tier.name)}» — ${toRemove.length} (баллов &lt; ${tier.threshold}):\n${listHtml}` + missTail + inviteHtml + `\n\nВыбери действие:`;
+  const plain = note + `❌ На вылет из «${tier.name}» — ${toRemove.length} (баллов < ${tier.threshold}):\n${listPlain}` + missTail + invitePlain + `\n\nВыбери действие:`;
+  try { await ctx.reply(html, { parse_mode: 'HTML', reply_markup: kb }); }
+  catch (e) { console.error('adm_calc', e.message); await ctx.reply(plain.slice(0, 4000), { reply_markup: kb }); }
 });
 
 // Приглашаем в тир всех, кто набрал его порог и ещё не в нём/не приглашён.
@@ -513,53 +528,48 @@ async function reinviteTier(pointsMap, tier) {
   return invited;
 }
 
-bot.callbackQuery('adm_commit', async (ctx) => {
+// Применяем импорт к тиру: всегда обновляем баллы; при remove — удаляем «на
+// вылет»; при invite — приглашаем набравших порог. Три кнопки = комбинации флагов.
+async function applyImport(ctx, { remove, invite }) {
   const session = store.getImport();
   const tier = tierByKey(session?.tier);
   if (!session || !session.files.length || !tier) { await ctx.answerCallbackQuery('Нет данных.'); return ctx.reply('Нет активного импорта.', { reply_markup: mainMenu() }); }
-  if (applying) { await ctx.answerCallbackQuery('Уже выполняется…'); return; }
-  applying = true; await ctx.answerCallbackQuery();
-  try {
-    const pointsMap = new Map(Object.entries(session.points));
-    if (pointsMap.size) store.commitPoints(pointsMap);
-    const invited = await reinviteTier(pointsMap, tier);
-    store.clearImport();
-    await ctx.reply(`✅ «${tier.name}»: баллы обновлены, никого не удаляли.\n🎉 Приглашено (набрали порог): ${invited}`, { reply_markup: mainMenu() });
-  } catch (e) { console.error('adm_commit', e.message); await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() }); }
-  finally { applying = false; }
-});
-
-bot.callbackQuery('adm_confirm', async (ctx) => {
-  const session = store.getImport();
-  const tier = tierByKey(session?.tier);
-  if (!session || !session.reviewed || !tier) { await ctx.answerCallbackQuery('Сначала «Посчитать».'); return ctx.reply('Сначала «Посчитать», потом подтверждай.', { reply_markup: mainMenu() }); }
+  if (remove && !session.reviewed) { await ctx.answerCallbackQuery('Сначала «Посчитать».'); return ctx.reply('Сначала «Посчитать на вылет», потом удаляй.', { reply_markup: mainMenu() }); }
   if (applying) { await ctx.answerCallbackQuery('Уже выполняется, подожди…'); return; }
   applying = true; await ctx.answerCallbackQuery();
-  await ctx.reply(`⏳ «${tier.name}»: применяю удаление до ${session.reviewed.length}…`);
   try {
     const pointsMap = new Map(Object.entries(session.points));
     if (pointsMap.size) store.commitPoints(pointsMap);
     let removed = 0, skipped = 0;
-    for (const r of session.reviewed) {
-      const m = store.getMember(r.doterraId);
-      const pv = pointsMap.has(r.doterraId) ? pointsMap.get(r.doterraId) : null;
-      if (!m || m.tiers?.[tier.key] !== 'in' || pv == null || !(pv < tier.threshold)) { skipped++; continue; }
-      const { banned } = await banFromTier(m.userId, tier);
-      if (banned) {
-        store.setTierState(m.doterraId, tier.key, null);
-        removed++;
-        try { await bot.api.sendMessage(m.userId, `😔 Доступ в «${tier.name}» приостановлен.\n\nУ тебя ${pv}, а нужно ${tier.threshold} баллов. Наберёшь — нажми /check, и я снова открою.`); } catch {}
+    if (remove) {
+      await ctx.reply(`⏳ «${tier.name}»: удаляю до ${session.reviewed.length}…`);
+      for (const r of session.reviewed) {
+        const m = store.getMember(r.doterraId);
+        const pv = pointsMap.has(r.doterraId) ? pointsMap.get(r.doterraId) : null;
+        if (!m || m.tiers?.[tier.key] !== 'in' || pv == null || !(pv < tier.threshold)) { skipped++; continue; }
+        const { banned } = await banFromTier(m.userId, tier);
+        if (banned) {
+          store.setTierState(m.doterraId, tier.key, null);
+          removed++;
+          try { await bot.api.sendMessage(m.userId, `😔 Доступ в «${tier.name}» приостановлен.\n\nУ тебя ${pv}, а нужно ${tier.threshold} баллов. Наберёшь — нажми /check, и я снова открою.`); } catch {}
+        }
+        await sleep(350);
       }
-      await sleep(350);
     }
-    const invited = await reinviteTier(pointsMap, tier);
+    const invited = invite ? await reinviteTier(pointsMap, tier) : 0;
     store.clearImport();
-    let msg = `✅ Готово по «${tier.name}»:\n\n🗑 Удалено: ${removed}\n🎉 Приглашено: ${invited}`;
-    if (skipped) msg += `\nℹ️ Пропущено (вышли/восстановились): ${skipped}`;
+    let msg = `✅ Готово по «${tier.name}»:`;
+    if (remove) msg += `\n🗑 Удалено: ${removed}` + (skipped ? ` (пропущено ${skipped})` : '');
+    if (invite) msg += `\n🎉 Приглашено: ${invited}`;
+    if (!remove && !invite) msg += `\n⭐️ Баллы обновлены.`;
     await ctx.reply(msg, { reply_markup: mainMenu() });
-  } catch (e) { console.error('adm_confirm', e.message); await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() }); }
+  } catch (e) { console.error('applyImport', e.message); await ctx.reply('Ошибка: ' + e.message, { reply_markup: mainMenu() }); }
   finally { applying = false; }
-});
+}
+
+bot.callbackQuery('adm_del', (ctx) => applyImport(ctx, { remove: true, invite: false }));           // только удалить
+bot.callbackQuery(['adm_inv', 'adm_commit'], (ctx) => applyImport(ctx, { remove: false, invite: true })); // только пригласить
+bot.callbackQuery(['adm_both', 'adm_confirm'], (ctx) => applyImport(ctx, { remove: true, invite: true })); // удалить + пригласить
 
 // ─────────────────────────────────────────────────────────────────────────
 //  ТЕКСТ И СОБЫТИЯ ЧАТА
