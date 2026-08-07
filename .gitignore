@@ -1,4 +1,6 @@
 node_modules/
+.env
 store.json
+doterra-export-windows*.zip
 *.log
 .DS_Store

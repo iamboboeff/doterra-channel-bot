@@ -19,7 +19,10 @@ const EMPTY = {
   points: {}, // doterraId -> PV
   flows: {}, // userId -> { step }
   import: null, // { tier, points:{id:pv}, files:[], by, reviewed:[] }
-  admins: [], // userId[] — авто-админы (первые N, написавшие /start админ-боту)
+  inbox: null, // авто-пуш из расширения: { points:{id:pv}, month, cabinets:[], receivedAt, total, ge50 }
+  admins: [], // userId[] — авто-админы и админы, добавленные командой /addadmin
+  adminUsernames: [], // username[] — админы, добавленные командой /addadmin
+  adminPhones: [], // phone[] — ожидают подтверждения контактом в Telegram
   seen: {}, // userId -> { userId, name, username, tiers:{tierKey:lastISO} } — кого бот видел в чатах
 };
 
@@ -59,14 +62,87 @@ export function recordSeen(user, tierKey) {
 
 export function listSeen() { return Object.values(db().seen || {}); }
 
-// ── авто-админы (фолбэк: первые N, написавшие /start админ-боту) ────────────
-export function getAutoAdmins() { return db().admins || []; }
+// ── администраторы из хранилища ───────────────────────────────────────────
+// `admins` сохраняет обратную совместимость со старым авто-фолбэком, а также
+// содержит ID, добавленные работающим ботом через /addadmin.
+const cleanUsername = (value) => String(value ?? '').trim().replace(/^@/, '').toLowerCase();
+const cleanPhone = (value) => {
+  let digits = String(value ?? '').replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('8')) digits = '7' + digits.slice(1);
+  return digits;
+};
+
+export function getAutoAdmins() {
+  return (db().admins || []).map(Number).filter((id) => Number.isSafeInteger(id) && id > 0);
+}
 
 export function addAutoAdmin(userId) {
   const data = db();
   if (!data.admins) data.admins = [];
-  if (!data.admins.includes(userId)) { data.admins.push(userId); persist(data); }
+  const id = Number(userId);
+  if (!data.admins.some((x) => Number(x) === id)) { data.admins.push(id); persist(data); }
   return data.admins;
+}
+
+export function addAdminId(userId) {
+  const id = Number(userId);
+  const before = getAutoAdmins().includes(id);
+  addAutoAdmin(id);
+  return { added: !before, value: id };
+}
+
+export function addAdminUsername(username) {
+  const data = db();
+  const value = cleanUsername(username);
+  if (!data.adminUsernames) data.adminUsernames = [];
+  const added = !!value && !data.adminUsernames.includes(value);
+  if (added) { data.adminUsernames.push(value); persist(data); }
+  return { added, value };
+}
+
+export function addAdminPhone(phone) {
+  const data = db();
+  const value = cleanPhone(phone);
+  if (!data.adminPhones) data.adminPhones = [];
+  const added = !!value && !data.adminPhones.includes(value);
+  if (added) { data.adminPhones.push(value); persist(data); }
+  return { added, value };
+}
+
+export function isStoredAdmin(user) {
+  if (!user?.id) return false;
+  const data = db();
+  if ((data.admins || []).some((id) => Number(id) === Number(user.id))) return true;
+  const username = cleanUsername(user.username);
+  return !!username && (data.adminUsernames || []).includes(username);
+}
+
+export function hasPendingAdminPhones() {
+  return (db().adminPhones || []).length > 0;
+}
+
+// Номер подтверждается только контактом самого отправителя: обработчик бота
+// отдельно сверяет contact.user_id с ctx.from.id.
+export function claimAdminPhone(user, phone) {
+  if (!user?.id) return { ok: false };
+  const data = db();
+  const value = cleanPhone(phone);
+  if (!value || !(data.adminPhones || []).includes(value)) return { ok: false };
+  if (!data.admins) data.admins = [];
+  const id = Number(user.id);
+  if (!data.admins.some((x) => Number(x) === id)) data.admins.push(id);
+  data.adminPhones = data.adminPhones.filter((x) => x !== value); // номер больше не храним
+  persist(data);
+  return { ok: true, userId: id };
+}
+
+export function getAdminAccess() {
+  const data = db();
+  return {
+    ids: (data.admins || []).map(Number).filter((id) => Number.isSafeInteger(id) && id > 0),
+    usernames: [...(data.adminUsernames || [])],
+    phones: [...(data.adminPhones || [])],
+  };
 }
 
 // ── участники ───────────────────────────────────────────────────────────
@@ -198,4 +274,63 @@ export function clearImport() {
   const data = db();
   data.import = null;
   persist(data);
+}
+
+// ── входящие из расширения (авто-пуш) ──────────────────────────────────────
+// Расширение шлёт снимок ID·Имя·PV прямо боту (HTTP /ingest). Складываем в
+// «inbox» отдельно от админской сессии импорта: тир ещё не выбран. Несколько
+// выгрузок за ОДИН месяц (два кабинета) объединяем по МАКСИМУМУ PV на id.
+// Пришёл другой месяц — набор начинаем заново, чтобы не тащить старые баллы.
+export function ingestInbox(records, meta = {}) {
+  const data = db();
+  const month = String(meta.month || '').trim();
+  let box = data.inbox;
+  if (!box || (month && box.month && box.month !== month)) {
+    box = { points: {}, month: month || (box?.month || ''), cabinets: [] };
+  }
+  if (month) box.month = month;
+  if (!box.points) box.points = {};
+  let added = 0;
+  for (const r of records) {
+    const id = String(r.id ?? '').trim();
+    if (!id) continue;
+    const pv = Number(r.points ?? r.pv);
+    const val = Number.isFinite(pv) ? pv : 0;
+    const prev = Object.prototype.hasOwnProperty.call(box.points, id) ? box.points[id] : -Infinity;
+    box.points[id] = Math.max(prev, val);
+    added++;
+  }
+  box.receivedAt = new Date().toISOString();
+  box.cabinets = box.cabinets || [];
+  box.cabinets.push({ label: String(meta.cabinet || '').trim(), count: added, at: box.receivedAt });
+  box.total = Object.keys(box.points).length;
+  box.ge50 = Object.values(box.points).filter((v) => v >= 50).length;
+  data.inbox = box;
+  persist(data);
+  return { added, total: box.total, ge50: box.ge50, month: box.month, cabinets: box.cabinets.length };
+}
+
+export function getInbox() { return db().inbox || null; }
+
+export function clearInbox() {
+  const data = db();
+  data.inbox = null;
+  persist(data);
+}
+
+// Завести админскую сессию импорта на выбранный тир ИЗ уже полученных «входящих».
+// Дальше идёт обычный путь «Посчитать → Удалить/Пригласить».
+export function startImportFromInbox(userId, tier) {
+  const data = db();
+  const box = data.inbox;
+  if (!box || !box.points || !Object.keys(box.points).length) return null;
+  data.import = {
+    tier,
+    points: { ...box.points },
+    files: [{ name: '📲 из расширения' + (box.month ? ' · ' + box.month : ''), count: Object.keys(box.points).length }],
+    by: userId,
+    reviewed: null,
+  };
+  persist(data);
+  return data.import;
 }

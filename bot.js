@@ -1,8 +1,10 @@
 import 'dotenv/config';
-import { Bot, InlineKeyboard } from 'grammy';
+import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { parseCSV, detectColumns, extractRecords } from './csv.js';
 import { classify } from './logic.js';
+import { parseAdminTarget } from './admin-access.js';
 import * as store from './store.js';
+import { startIngestServer } from './ingest.js';
 
 // ─────────────────────────────────────────────────────────────────────────
 //  ОДИН БОТ НА ВСЁ
@@ -56,7 +58,7 @@ if (!TIERS.length) console.warn('⚠️  Не настроено ни одног
 const bot = new Bot(BOT_TOKEN);
 
 const isAdmin = (u) =>
-  !!u && (ADMIN_IDS.has(u.id) || (u.username && ADMIN_USERNAMES.has(u.username.toLowerCase())) || store.getAutoAdmins().includes(u.id));
+  !!u && (ADMIN_IDS.has(u.id) || (u.username && ADMIN_USERNAMES.has(u.username.toLowerCase())) || store.isStoredAdmin(u));
 const fmtPv = (pv) => (pv == null ? '—' : pv);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -189,10 +191,12 @@ async function evaluateAndReply(ctx, member) {
 // ─────────────────────────────────────────────────────────────────────────
 function mainMenu() {
   return new InlineKeyboard()
-    .text('📥 Обновить подписчиков', 'adm_update').row()
+    .text('📲 Данные из расширения', 'adm_inbox').row()
+    .text('📥 Обновить файлом (CSV)', 'adm_update').row()
     .text('📋 Список участников', 'adm_list').row()
     .text('👀 Кто не зарегистрирован', 'adm_unreg').row()
     .text('🔗 Отвязать участника', 'adm_unbind_start').row()
+    .text('👑 Администраторы', 'adm_admins').row()
     .text('ℹ️ Статус', 'adm_status');
 }
 
@@ -213,6 +217,29 @@ function applyKeyboard(nRemove, nInvite) {
 }
 const showAdminPanel = (ctx) =>
   ctx.reply('🛠 Админ-панель doTERRA\n\nВыбери действие кнопкой ниже. Другие команды — /help.', { reply_markup: mainMenu() });
+
+const phoneConfirmKeyboard = () =>
+  new Keyboard().requestContact('📱 Отправить мой номер').resized().oneTime();
+
+function adminListText() {
+  const dynamic = store.getAdminAccess();
+  const envIds = [...ADMIN_IDS].map(String);
+  const envNames = [...ADMIN_USERNAMES].map((name) => '@' + name);
+  const dynamicNames = dynamic.usernames.map((name) => '@' + name);
+  const pendingPhones = dynamic.phones.map((phone) => '+' + phone);
+  const lines = [
+    '👑 Администраторы',
+    '',
+    `По ID из настроек: ${envIds.length ? envIds.join(', ') : '—'}`,
+    `По username из настроек: ${envNames.length ? envNames.join(', ') : '—'}`,
+    `Добавлены по ID: ${dynamic.ids.length ? dynamic.ids.join(', ') : '—'}`,
+    `Добавлены по username: ${dynamicNames.length ? dynamicNames.join(', ') : '—'}`,
+    `Ожидают подтверждение телефона: ${pendingPhones.length ? pendingPhones.join(', ') : '—'}`,
+    '',
+    'Добавить: /addadmin <ID | @username | +телефон>',
+  ];
+  return lines.join('\n');
+}
 
 // Пассивное отслеживание членства: если ЗАРЕГИСТРИРОВАННЫЙ участник пишет в
 // чате-тире — значит он реально там; помечаем 'in'. Сообщение не перехватываем.
@@ -248,6 +275,12 @@ bot.command('admin', async (ctx) => {
     await ctx.reply('✅ Ты добавлен как администратор (первичная настройка).');
     return showAdminPanel(ctx);
   }
+  if (ctx.chat?.type === 'private' && store.hasPendingAdminPhones()) {
+    return ctx.reply(
+      'Если администратор добавил тебя по номеру телефона, нажми кнопку ниже. Telegram отправит боту только твой собственный контакт для проверки.',
+      { reply_markup: phoneConfirmKeyboard() }
+    );
+  }
   await ctx.reply('Эта команда только для администраторов.');
 });
 
@@ -269,7 +302,7 @@ bot.command(['id', 'chatid'], (ctx) => {
 
 bot.command('help', (ctx) => {
   if (isAdmin(ctx.from)) {
-    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
+    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /addadmin <ID | @username | +телефон> — добавить администратора\n• /admins — показать список администраторов\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
   }
   return ctx.reply('Я открываю доступ в чаты «Бережное врачевание» по баллам doTERRA.\n\n• /start — зарегистрироваться\n• /check — проверить свой доступ\n\nНужно прислать свой doTERRA ID (7–8 цифр).');
 });
@@ -277,6 +310,42 @@ bot.command('help', (ctx) => {
 // ─────────────────────────────────────────────────────────────────────────
 //  АДМИНСКИЕ КОМАНДЫ
 // ─────────────────────────────────────────────────────────────────────────
+bot.command('addadmin', async (ctx) => {
+  if (!isAdmin(ctx.from)) return ctx.reply('Эта команда только для администраторов.');
+  if (ctx.chat?.type !== 'private') return ctx.reply('Для безопасности добавляй администраторов только в личном чате с ботом.');
+
+  const target = parseAdminTarget(ctx.match || '');
+  if (!target.ok) {
+    return ctx.reply(
+      `${target.error}\n\nПримеры:\n/addadmin 765332286\n/addadmin @marina_nastavnik2810\n/addadmin phone +79991234567`
+    );
+  }
+
+  if (target.type === 'id') {
+    const result = store.addAdminId(target.value);
+    return ctx.reply(result.added
+      ? `✅ Администратор ${target.display} добавлен. Он может сразу открыть /admin.`
+      : `ℹ️ ${target.display} уже есть среди добавленных администраторов.`);
+  }
+  if (target.type === 'username') {
+    const result = store.addAdminUsername(target.value);
+    return ctx.reply(result.added
+      ? `✅ Администратор ${target.display} добавлен. Доступ действует, пока у аккаунта этот username.`
+      : `ℹ️ ${target.display} уже есть среди добавленных администраторов.`);
+  }
+
+  const result = store.addAdminPhone(target.value);
+  return ctx.reply(result.added
+    ? `✅ Номер ${target.display} добавлен на подтверждение.\n\nПусть человек откроет этого бота, отправит /admin и нажмёт «📱 Отправить мой номер». После совпадения бот запомнит его Telegram ID и удалит номер из базы.`
+    : `ℹ️ Номер ${target.display} уже ожидает подтверждения.`);
+});
+
+bot.command('admins', async (ctx) => {
+  if (!isAdmin(ctx.from)) return ctx.reply('Эта команда только для администраторов.');
+  if (ctx.chat?.type !== 'private') return ctx.reply('Список администраторов доступен только в личном чате с ботом.');
+  return ctx.reply(adminListText());
+});
+
 bot.command('rebind', async (ctx) => {
   if (!isAdmin(ctx.from)) return ctx.reply('Эта команда только для администраторов.');
   const [doterraId, newUid] = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
@@ -312,6 +381,11 @@ bot.on('callback_query:data', async (ctx, next) => {
   await next();
 });
 
+bot.callbackQuery('adm_admins', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.reply(adminListText(), { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') });
+});
+
 // «Обновить подписчиков» → выбор чата (тира)
 bot.callbackQuery('adm_update', async (ctx) => {
   await ctx.answerCallbackQuery();
@@ -331,6 +405,69 @@ bot.callbackQuery(/^adm_tier:(\w+)$/, async (ctx) => {
     `📊 Обновляем «${tier.name}» (порог ${tier.threshold} баллов).\n\n📥 Пришли CSV-файл из расширения. Если кабинета два — присылай оба по очереди, потом жми «Посчитать на вылет».`,
     { reply_markup: new InlineKeyboard().text('✅ Посчитать на вылет', 'adm_calc').text('❌ Отмена', 'adm_cancel') }
   );
+});
+
+// ── Авто-пуш из расширения: входящие + уведомление ──────────────────────────
+// Кому слать пуш о новых данных: явные ADMIN_IDS + авто-админы. Тех, кто задан
+// только по @username (без user_id), написать нельзя — они увидят данные в меню.
+function adminUserIds() {
+  const ids = new Set(store.getAdminAccess().ids);
+  for (const id of ADMIN_IDS) ids.add(id);
+  return [...ids];
+}
+
+async function notifyAdminsOfPush(summary) {
+  const kb = new InlineKeyboard();
+  TIERS.forEach((t) => kb.text(`Проверить: ${t.name} (от ${t.threshold})`, `adm_pushtier:${t.key}`).row());
+  kb.text('🔕 Позже', 'adm_dismiss_push');
+  const text =
+    `📲 <b>Пришли данные из расширения</b>\n` +
+    (summary?.month ? `📅 ${escHtml(summary.month)}\n` : '') +
+    `👥 Всего: ${summary?.total ?? '?'} · PV≥50: ${summary?.ge50 ?? '?'} · выгрузок в наборе: ${summary?.cabinets ?? 1}\n\n` +
+    `Проверить чат на вылет:`;
+  const ids = adminUserIds();
+  if (!ids.length) { console.log('ingest: некому слать пуш (нет ADMIN_IDS/авто-админов).'); return; }
+  for (const uid of ids) {
+    try { await tgRetry(() => bot.api.sendMessage(uid, text, { parse_mode: 'HTML', reply_markup: kb })); }
+    catch (e) { console.error('пуш админу', uid, e.message); }
+  }
+}
+
+async function showInbox(ctx) {
+  const box = store.getInbox();
+  if (!box || !box.total) {
+    return ctx.reply('📲 Пока данных из расширения нет.\n\nОткрой в doTERRA «Команда → Структура», нажми «Экспорт» в расширении — данные сами прилетят сюда.', { reply_markup: mainMenu() });
+  }
+  const kb = new InlineKeyboard();
+  TIERS.forEach((t) => kb.text(`Проверить: ${t.name} (от ${t.threshold})`, `adm_pushtier:${t.key}`).row());
+  kb.text('◀️ Назад', 'adm_back');
+  const when = box.receivedAt ? new Date(box.receivedAt).toLocaleString('ru-RU') : '—';
+  await ctx.reply(
+    `📲 Данные из расширения${box.month ? ' · ' + escHtml(box.month) : ''}\n` +
+    `👥 Всего: ${box.total} · PV≥50: ${box.ge50 ?? '—'} · выгрузок: ${box.cabinets?.length || 1}\n` +
+    `🕒 Получено: ${when}\n\nВыбери чат для проверки на вылет:`,
+    { parse_mode: 'HTML', reply_markup: kb }
+  );
+}
+
+bot.callbackQuery('adm_inbox', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await showInbox(ctx);
+});
+
+// Проверить выбранный чат по последним данным из расширения (без присланного файла).
+bot.callbackQuery(/^adm_pushtier:(\w+)$/, async (ctx) => {
+  const tier = tierByKey(ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  if (!tier) return ctx.reply('Чат не найден.', { reply_markup: mainMenu() });
+  if (!store.startImportFromInbox(ctx.from.id, tier.key)) {
+    return ctx.reply('Пока нет данных из расширения. Нажми «Экспорт» в расширении doTERRA — они прилетят сюда сами.', { reply_markup: mainMenu() });
+  }
+  await calcAndShow(ctx);
+});
+
+bot.callbackQuery('adm_dismiss_push', async (ctx) => {
+  await ctx.answerCallbackQuery('Ок! Данные сохранены. Открой /admin, когда будешь готов проверить.');
 });
 
 bot.callbackQuery('adm_list', async (ctx) => {
@@ -453,11 +590,10 @@ bot.on('message:document', async (ctx) => {
   } catch (e) { await ctx.reply('Ошибка чтения файла: ' + e.message); }
 });
 
-bot.callbackQuery('adm_calc', async (ctx) => {
+async function calcAndShow(ctx) {
   const session = store.getImport();
-  await ctx.answerCallbackQuery();
   const tier = tierByKey(session?.tier);
-  if (!session || !session.files.length || !tier) return ctx.reply('Сначала выбери чат и пришли CSV.');
+  if (!session || !session.files.length || !tier) return ctx.reply('Сначала выбери чат и пришли данные.', { reply_markup: mainMenu() });
 
   // Сверяем реальное членство перед подсчётом: кто из привязанных сейчас в чате.
   let note = '';
@@ -508,7 +644,8 @@ bot.callbackQuery('adm_calc', async (ctx) => {
   const plain = note + `❌ На вылет из «${tier.name}» — ${toRemove.length} (баллов < ${tier.threshold}):\n${listPlain}` + missTail + invitePlain + `\n\nВыбери действие:`;
   try { await ctx.reply(html, { parse_mode: 'HTML', reply_markup: kb }); }
   catch (e) { console.error('adm_calc', e.message); await ctx.reply(plain.slice(0, 4000), { reply_markup: kb }); }
-});
+}
+bot.callbackQuery('adm_calc', async (ctx) => { await ctx.answerCallbackQuery(); await calcAndShow(ctx); });
 
 // Приглашаем в тир всех, кто набрал его порог и ещё не в нём/не приглашён.
 async function reinviteTier(pointsMap, tier) {
@@ -574,6 +711,23 @@ bot.callbackQuery(['adm_both', 'adm_confirm'], (ctx) => applyImport(ctx, { remov
 // ─────────────────────────────────────────────────────────────────────────
 //  ТЕКСТ И СОБЫТИЯ ЧАТА
 // ─────────────────────────────────────────────────────────────────────────
+bot.on('message:contact', async (ctx) => {
+  if (ctx.chat?.type !== 'private') return;
+  const contact = ctx.message.contact;
+  const removeKeyboard = { remove_keyboard: true };
+  if (!contact?.user_id || contact.user_id !== ctx.from.id) {
+    await ctx.reply('Нужно нажать кнопку «📱 Отправить мой номер» и отправить именно свой контакт.', { reply_markup: removeKeyboard });
+    return;
+  }
+  const claimed = store.claimAdminPhone(ctx.from, contact.phone_number);
+  if (!claimed.ok) {
+    await ctx.reply('Этот номер не ожидает подтверждения администратора. Доступ не выдан.', { reply_markup: removeKeyboard });
+    return;
+  }
+  await ctx.reply('✅ Номер подтверждён. Ты добавлен как администратор.', { reply_markup: removeKeyboard });
+  await showAdminPanel(ctx);
+});
+
 bot.on('message:text', async (ctx) => {
   if (ctx.chat?.type !== 'private') return; // регистрация/отвязка — только в личке, не в группах
   // 1) Админ вводит ID для отвязки — этот шаг в приоритете.
@@ -634,6 +788,19 @@ bot.on('my_chat_member', (ctx) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// HTTP-приём данных из расширения (авто-пуш). Поднимается только если задан
+// порт (PORT/INGEST_PORT) и секрет (INGEST_SECRET). Иначе — тихо выключен,
+// бот работает как раньше (приём CSV файлом остаётся).
+startIngestServer({
+  port: Number(process.env.PORT || process.env.INGEST_PORT || 0),
+  secret: process.env.INGEST_SECRET || '',
+  onPush: async (rows, meta) => {
+    const summary = store.ingestInbox(rows, meta);
+    await notifyAdminsOfPush(summary);
+    return summary;
+  },
+});
+
 bot.catch((err) => console.error('bot:', err.error?.message || err.message));
 bot.start({
   allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member'],
