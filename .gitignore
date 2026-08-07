@@ -1,6 +1,8 @@
 node_modules/
 .env
 store.json
+backups/
+store.json.tmp
 doterra-export-windows*.zip
 *.log
 .DS_Store

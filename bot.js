@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Bot, InlineKeyboard, Keyboard } from 'grammy';
+import { Bot, InlineKeyboard, InputFile, Keyboard } from 'grammy';
 import { parseCSV, detectColumns, extractRecords } from './csv.js';
 import { classify } from './logic.js';
 import { parseAdminTarget } from './admin-access.js';
@@ -197,6 +197,7 @@ function mainMenu() {
     .text('👀 Кто не зарегистрирован', 'adm_unreg').row()
     .text('🔗 Отвязать участника', 'adm_unbind_start').row()
     .text('👑 Администраторы', 'adm_admins').row()
+    .text('💾 Резервная копия БД', 'adm_backup').row()
     .text('ℹ️ Статус', 'adm_status');
 }
 
@@ -220,6 +221,21 @@ const showAdminPanel = (ctx) =>
 
 const phoneConfirmKeyboard = () =>
   new Keyboard().requestContact('📱 Отправить мой номер').resized().oneTime();
+
+async function sendDatabaseBackup(ctx) {
+  if (ctx.chat?.type !== 'private') {
+    return ctx.reply('Для безопасности резервную копию можно получить только в личном чате с ботом.');
+  }
+  const path = store.createBackupSnapshot(`admin-${ctx.from.id}`);
+  const info = store.getStorageInfo();
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  await ctx.replyWithDocument(
+    new InputFile(path, `doterra-bot-backup-${stamp}.json`),
+    {
+      caption: `💾 Резервная копия базы\n\nУчастников: ${info.members}\nСнимков на сервере: ${info.backups}\n\nХрани этот файл в закрытом месте: внутри есть Telegram ID и doTERRA ID участников.`,
+    }
+  );
+}
 
 function adminListText() {
   const dynamic = store.getAdminAccess();
@@ -302,7 +318,7 @@ bot.command(['id', 'chatid'], (ctx) => {
 
 bot.command('help', (ctx) => {
   if (isAdmin(ctx.from)) {
-    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /addadmin <ID | @username | +телефон> — добавить администратора\n• /admins — показать список администраторов\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
+    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /backup — скачать резервную копию базы\n• /addadmin <ID | @username | +телефон> — добавить администратора\n• /admins — показать список администраторов\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
   }
   return ctx.reply('Я открываю доступ в чаты «Бережное врачевание» по баллам doTERRA.\n\n• /start — зарегистрироваться\n• /check — проверить свой доступ\n\nНужно прислать свой doTERRA ID (7–8 цифр).');
 });
@@ -346,6 +362,11 @@ bot.command('admins', async (ctx) => {
   return ctx.reply(adminListText());
 });
 
+bot.command('backup', async (ctx) => {
+  if (!isAdmin(ctx.from)) return ctx.reply('Эта команда только для администраторов.');
+  return sendDatabaseBackup(ctx);
+});
+
 bot.command('rebind', async (ctx) => {
   if (!isAdmin(ctx.from)) return ctx.reply('Эта команда только для администраторов.');
   const [doterraId, newUid] = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
@@ -384,6 +405,11 @@ bot.on('callback_query:data', async (ctx, next) => {
 bot.callbackQuery('adm_admins', async (ctx) => {
   await ctx.answerCallbackQuery();
   await ctx.reply(adminListText(), { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') });
+});
+
+bot.callbackQuery('adm_backup', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  return sendDatabaseBackup(ctx);
 });
 
 // «Обновить подписчиков» → выбор чата (тира)

@@ -1,18 +1,33 @@
 // Файловое хранилище в store.json.
 // Каждая операция читает свежую версию файла и сразу пишет обратно — так бот
-// участников и админ-бот могут работать как ДВА процесса, деля один store.json
-// на общем диске (bothost: STORE_DIR=/app/shared при «Общем хранилище»).
+// переживает перезапуски и обновления кода. На Bothost файл должен лежать в
+// постоянном томе /app/data (STORE_DIR=/app/data).
 //
 // Членство участника хранится ПО КАЖДОМУ ЧАТУ (тиру) отдельно:
 //   member.tiers = { "1": "in" | "invited", "2": "in" | "invited", ... }
 //   "invited" — выдали ссылку, ждём входа; "in" — реально вступил.
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
-const DIR = process.env.STORE_DIR || dirname(fileURLToPath(import.meta.url));
+const DIR = process.env.STORE_DIR || process.env.DATA_DIR || dirname(fileURLToPath(import.meta.url));
 const FILE = resolve(DIR, 'store.json');
 const TMP = resolve(DIR, 'store.json.tmp');
+const BACKUP_DIR = resolve(DIR, 'backups');
+const BACKUP_KEEP = Math.max(3, Number(process.env.BACKUP_KEEP) || 30);
+const BACKUP_INTERVAL_MS = Math.max(1, Number(process.env.BACKUP_INTERVAL_HOURS) || 6) * 60 * 60 * 1000;
+let lastAutomaticBackupAt = 0;
+let backupSequence = 0;
 
 const EMPTY = {
   members: {}, // doterraId -> { doterraId, userId, username, name, registeredAt, tiers:{} }
@@ -26,12 +41,67 @@ const EMPTY = {
   seen: {}, // userId -> { userId, name, username, tiers:{tierKey:lastISO} } — кого бот видел в чатах
 };
 
+function hydrate(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid store format');
+  return { ...structuredClone(EMPTY), ...raw };
+}
+
+function backupFiles() {
+  if (!existsSync(BACKUP_DIR)) return [];
+  return readdirSync(BACKUP_DIR)
+    .filter((name) => /^store-.*\.json$/.test(name))
+    .map((name) => {
+      const path = resolve(BACKUP_DIR, name);
+      return { name, path, mtimeMs: statSync(path).mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
+}
+
+function readStore(path) {
+  return hydrate(JSON.parse(readFileSync(path, 'utf8')));
+}
+
 function db() {
   if (!existsSync(FILE)) return structuredClone(EMPTY);
   try {
-    return { ...structuredClone(EMPTY), ...JSON.parse(readFileSync(FILE, 'utf8')) };
-  } catch {
+    return readStore(FILE);
+  } catch (error) {
+    for (const backup of backupFiles()) {
+      try {
+        console.error(`store: основной файл повреждён, читаю резервную копию ${backup.name}`);
+        return readStore(backup.path);
+      } catch {}
+    }
+    console.error('store: база и резервные копии не читаются:', error.message);
     return structuredClone(EMPTY);
+  }
+}
+
+function snapshot(reason = 'auto', force = false) {
+  if (!existsSync(FILE)) return null;
+  const now = Date.now();
+  if (!force && now - lastAutomaticBackupAt < BACKUP_INTERVAL_MS) return null;
+
+  try {
+    mkdirSync(BACKUP_DIR, { recursive: true });
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+    const safeReason = String(reason || 'manual').replace(/[^a-z0-9_-]+/gi, '-').slice(0, 24) || 'manual';
+    const name = `store-${stamp}-${safeReason}-${backupSequence++}.json`;
+    const target = resolve(BACKUP_DIR, name);
+    const tmp = target + '.tmp';
+    copyFileSync(FILE, tmp);
+    renameSync(tmp, target);
+    if (!force) lastAutomaticBackupAt = now;
+
+    for (const old of backupFiles().slice(BACKUP_KEEP)) {
+      try { unlinkSync(old.path); } catch {}
+    }
+    return target;
+  } catch (error) {
+    // Ошибка резервного копирования не должна ломать регистрацию участника:
+    // основной store.json к этому моменту уже надёжно записан.
+    console.error('store backup:', error.message);
+    return null;
   }
 }
 
@@ -39,10 +109,29 @@ function persist(data) {
   try { mkdirSync(DIR, { recursive: true }); } catch {}
   writeFileSync(TMP, JSON.stringify(data, null, 2));
   renameSync(TMP, FILE);
+  snapshot('auto', false);
 }
 
 export function getData() { return db(); }
 export function save() {}
+
+// Принудительный снимок для /backup. Возвращает путь к готовому JSON-файлу,
+// который можно безопасно отправить только администратору в личный чат.
+export function createBackupSnapshot(reason = 'manual') {
+  if (!existsSync(FILE)) persist(structuredClone(EMPTY));
+  return snapshot(reason, true) || FILE;
+}
+
+export function getStorageInfo() {
+  const files = backupFiles();
+  return {
+    directory: DIR,
+    file: FILE,
+    backups: files.length,
+    lastBackupAt: files[0] ? new Date(files[0].mtimeMs).toISOString() : null,
+    members: Object.keys(db().members || {}).length,
+  };
+}
 
 // ── «Замеченные» в чатах ────────────────────────────────────────────────
 // Кого бот видел писавшим/входившим в чате тира — чтобы находить среди них
