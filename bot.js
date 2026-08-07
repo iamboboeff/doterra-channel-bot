@@ -164,7 +164,7 @@ async function admit(member) {
       if (link) { res.links.push(`${t.name}: ${link}`); store.setTierState(fresh.doterraId, t.key, 'invited'); }
       else res.soon.push(t.name); // чат ещё не подключён
     } else {
-      res.lack.push(`${t.name} — нужно ${t.threshold}`);
+      res.lack.push(`«${t.name}» — нужно ${t.threshold}, не хватает ${Math.round((t.threshold - pv) * 10) / 10}`);
     }
   }
   return res;
@@ -172,17 +172,22 @@ async function admit(member) {
 
 async function evaluateAndReply(ctx, member) {
   const r = await admit(member);
+  // Баллов нет в снимке — человек зарегистрировался между обновлениями базы.
+  // Это норма в середине месяца, поэтому объясняем, а не отделываемся «ждите».
   if (r.pv == null) {
     await ctx.reply(
-      `✅ Готово — ID ${member.doterraId} принят!\n\nБаллы подтянутся при ближайшем обновлении базы. Как только доступ откроется, я сразу напишу.`
+      `✅ Принято! ID ${member.doterraId} привязан к твоему аккаунту.\n\n` +
+        `Твоих баллов у меня пока нет: список подтягивают из кабинета doTERRA примерно раз в месяц. ` +
+        `Как только баллы появятся и их хватит — я сам пришлю ссылку, ничего делать не нужно.\n\n` +
+        `Хочешь проверить раньше — нажми /check.`
     );
     return;
   }
   let msg = '';
-  if (r.links.length) msg += `🎉 Доступ открыт! Заходи по ссылкам ниже (одноразовые, действуют сутки):\n\n${r.links.join('\n')}\n\n`;
+  if (r.links.length) msg += `🎉 Доступ открыт! Заходи по ссылке:\n\n${r.links.join('\n')}\n\n⏳ Ссылка личная, работает сутки и только один раз. Не успел — нажми /check, пришлю новую.\n\n`;
   if (r.inNow.length) msg += `✅ Ты уже в: ${r.inNow.join(', ')}.\n`;
   if (r.soon.length) msg += `⏳ Доступ положен, но ${r.soon.join(', ')} ещё настраивается — загляни позже через /check.\n`;
-  if (r.lack.length) msg += `📊 Пока не хватает баллов (у тебя ${r.pv}):\n• ${r.lack.join('\n• ')}\n`;
+  if (r.lack.length) msg += `📊 У тебя ${r.pv} балл(ов). Пока не хватает:\n• ${r.lack.join('\n• ')}\n\nНаберёшь — нажми /check, и я открою доступ.\n`;
   await ctx.reply((msg || `Твои баллы: ${r.pv}. Доступных чатов пока нет.`).trim());
 }
 
@@ -278,7 +283,13 @@ bot.command('start', async (ctx) => {
     return;
   }
   store.setFlow(ctx.from.id, 'awaiting_id');
-  await ctx.reply(`👋 Привет! Это бот доступа в чаты «Бережное врачевание».\n\nЧтобы войти, пришли свой ID участника doTERRA — номер из личного кабинета (обычно 7–8 цифр).\n\nНапример: 18170008`);
+  const doors = TIERS.map((t) => `• «${t.name}» — от ${t.threshold} баллов`).join('\n');
+  await ctx.reply(
+    `👋 Привет! Я открываю доступ в чаты «Бережное врачевание» по баллам doTERRA (PV за месяц).\n\n` +
+      (doors ? `Куда можно попасть:\n${doors}\n\n` : '') +
+      `👉 Пришли свой ID участника doTERRA — номер из личного кабинета, обычно 7–8 цифр. Например: 18170008\n\n` +
+      `Найти его: кабинет doTERRA → «Мой офис», номер рядом с именем.`
+  );
 });
 
 // /admin — явный вход в панель. Для не-админа работает только как первичная
@@ -319,7 +330,16 @@ bot.command('help', (ctx) => {
   if (isAdmin(ctx.from)) {
     return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /backup — скачать резервную копию базы\n• /addadmin <ID | @username | +телефон> — добавить администратора\n• /admins — показать список администраторов\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
   }
-  return ctx.reply('Я открываю доступ в чаты «Бережное врачевание» по баллам doTERRA.\n\n• /start — зарегистрироваться\n• /check — проверить свой доступ\n\nНужно прислать свой doTERRA ID (7–8 цифр).');
+  const doors = TIERS.map((t) => `• «${t.name}» — от ${t.threshold} баллов`).join('\n');
+  return ctx.reply(
+    `Я открываю доступ в чаты «Бережное врачевание» по баллам doTERRA (PV за месяц).\n\n` +
+      (doors ? `Куда можно попасть:\n${doors}\n\n` : '') +
+      `Команды:\n• /start — зарегистрироваться (нужен doTERRA ID, 7–8 цифр)\n• /check — проверить доступ и получить ссылку\n\n` +
+      `Частые вопросы:\n` +
+      `• Ссылка не открылась или истекла? Нажми /check — пришлю новую.\n` +
+      `• Баллы набрал, а доступа нет? Список из кабинета обновляют примерно раз в месяц. Нажми /check — если баллы уже видны, открою сразу.\n` +
+      `• Ошибся в ID? Просто пришли правильный номер.`
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -647,15 +667,26 @@ bot.callbackQuery('adm_calc', async (ctx) => { await ctx.answerCallbackQuery(); 
 async function reinviteTier(pointsMap, tier) {
   let invited = 0;
   for (const m of store.listMembers()) {
-    if (m.tiers?.[tier.key]) continue; // уже in или invited
+    const state = m.tiers?.[tier.key];
+    if (state === 'in') continue;
     const pv = pointsMap.get(m.doterraId);
-    if (pv != null && pv >= tier.threshold && tier.id) {
-      const link = await inviteLink(m, tier);
-      if (link) {
-        store.setTierState(m.doterraId, tier.key, 'invited');
-        try { await bot.api.sendMessage(m.userId, `🎉 Ты набрал нужные баллы! Открылся доступ в «${tier.name}»:\n${link}`); } catch {}
-        invited++; await sleep(300);
+    if (pv == null || pv < tier.threshold || !tier.id) continue;
+    // Помечен «приглашён», но в чате его нет — ссылка живёт сутки и могла
+    // протухнуть. Раньше такие выпадали навсегда: массовая рассылка их
+    // пропускала, и вытащить себя человек мог только сам через /check.
+    // Сверяем реальный статус, чтобы не слать тем, кто уже внутри.
+    if (state === 'invited') {
+      if (isInsideStatus(await chatMemberStatus(tier, m.userId))) {
+        store.setTierState(m.doterraId, tier.key, 'in');
+        continue;
       }
+    }
+    const link = await inviteLink(m, tier);
+    if (link) {
+      store.setTierState(m.doterraId, tier.key, 'invited');
+      const again = state === 'invited' ? ' (прежняя ссылка истекла — вот новая)' : '';
+      try { await bot.api.sendMessage(m.userId, `🎉 Открыт доступ в «${tier.name}»${again}:\n${link}\n\nСсылка личная, работает сутки и только один раз.`); } catch {}
+      invited++; await sleep(300);
     }
   }
   return invited;
