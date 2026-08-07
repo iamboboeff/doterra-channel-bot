@@ -807,10 +807,79 @@ bot.on('chat_member', (ctx) => {
 
 // Бота добавили в чат / сменили статус → печатаем id чата в лог хостинга.
 // Удобно, чтобы узнать TIERn_ID сразу после добавления бота в чат.
-bot.on('my_chat_member', (ctx) => {
+bot.on('my_chat_member', async (ctx) => {
   const c = ctx.chat;
   const status = ctx.myChatMember?.new_chat_member?.status;
   console.log(`ℹ️ Чат: id=${c.id} type=${c.type} status=${status} title=${JSON.stringify(c.title || '')}`);
+  // Канал + админка = это приёмник CSV из расширения, запоминаем сразу.
+  if (c.type === 'channel' && status === 'administrator') await adoptImportChannel(c);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Приём CSV через приватный канал — альтернатива HTTP-пушу для случая, когда у
+// бота нет публичного адреса. Расширение постит файл в канал ОТДЕЛЬНЫМ ботом-
+// загрузчиком, а этот бот, будучи там администратором, забирает файл и кладёт
+// в тот же инбокс, что и HTTP-пуш.
+//
+// Почему загрузчик обязан быть другим ботом (проверено эмпирически): своего
+// поста бот не получает — sendDocument в канал проходит, а channel_post на него
+// не приходит. Пост другого бота приходит нормально.
+const ENV_IMPORT_CHANNEL = Number(process.env.IMPORT_CHANNEL_ID) || null;
+const importChannelId = () => ENV_IMPORT_CHANNEL || store.getImportChannel()?.id || null;
+const seenChannelFiles = new Set(); // file_unique_id — чтобы не считать один файл дважды
+
+async function tellAdmins(text) {
+  for (const uid of adminUserIds()) {
+    try { await tgRetry(() => bot.api.sendMessage(uid, text, { parse_mode: 'HTML' })); }
+    catch (e) { console.error('сообщение админу', uid, e.message); }
+  }
+}
+
+// Первый канал, где бот оказался админом, становится приёмником. Дальше чужие
+// каналы игнорируются: иначе кто угодно подсунул бы боту свои баллы.
+async function adoptImportChannel(chat) {
+  const known = importChannelId();
+  if (known) return known === chat.id;
+  store.setImportChannel(chat.id, chat.title);
+  await tellAdmins(
+    `📡 Канал «${escHtml(chat.title || 'без названия')}» подключён как приёмник CSV.\n\n` +
+      `Вставь этот chat_id в расширение:\n<code>${chat.id}</code>`
+  );
+  return true;
+}
+
+// «doterra-Июль-2026.csv» → «Июль 2026». Берём только пару «месяц + год»: к имени
+// может быть приклеена метка кабинета, и без этого она утекала бы в месяц.
+function monthFromFileName(name) {
+  const m = String(name || '').replace(/\.csv$/i, '').match(/(\p{L}+)[\s-]+(\d{4})/u);
+  return m ? `${m[1]} ${m[2]}` : '';
+}
+
+bot.on('channel_post', async (ctx) => {
+  if (!(await adoptImportChannel(ctx.chat))) return;
+  const post = ctx.channelPost;
+  // reply_to_message — запасной путь: если файл почему-то оказался постом этого
+  // же бота, достаточно ответить на него любым текстом.
+  const doc = post.document || post.reply_to_message?.document;
+  if (!doc || seenChannelFiles.has(doc.file_unique_id)) return;
+  try {
+    const file = await bot.api.getFile(doc.file_id);
+    if (Number(file.file_size || 0) > 5_000_000) throw new Error('файл слишком большой');
+    const resp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const rows = parseCSV(await resp.text());
+    if (!rows.length) throw new Error('файл пустой — похоже, страница не догрузилась');
+    const det = detectColumns(rows);
+    if (det.idIdx < 0 || det.pointsIdx < 0) throw new Error('не нашёл колонки ID и PV — это файл от расширения?');
+    const records = extractRecords(rows, det.idIdx, det.pointsIdx);
+    if (!records.length) throw new Error('в файле только заголовок, ни одной строки');
+    seenChannelFiles.add(doc.file_unique_id);
+    const summary = store.ingestInbox(records, { month: monthFromFileName(doc.file_name), cabinet: post.caption || '' });
+    await notifyAdminsOfPush(summary);
+  } catch (e) {
+    console.error('канал:', e.message);
+    await tellAdmins(`⚠️ Файл из канала не принят: ${escHtml(e.message)}`);
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -829,6 +898,7 @@ startIngestServer({
 
 bot.catch((err) => console.error('bot:', err.error?.message || err.message));
 bot.start({
-  allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member'],
+  // channel_post — файлы из расширения через канал-приёмник.
+  allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member', 'channel_post'],
   onStart: () => console.log('✓ Бот запущен (участники + админка в одном)'),
 });

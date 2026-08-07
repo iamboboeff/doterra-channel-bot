@@ -40,6 +40,7 @@ const EMPTY = {
   adminUsernames: [], // username[] — админы, добавленные командой /addadmin
   adminPhones: [], // phone[] — ожидают подтверждения контактом в Telegram
   seen: {}, // userId -> { userId, name, username, tiers:{tierKey:lastISO} } — кого бот видел в чатах
+  importChannel: null, // { id, title, at } — приватный канал, куда расширение постит CSV
 };
 
 function hydrate(raw) {
@@ -397,6 +398,16 @@ export function clearImport() {
 // «inbox» отдельно от админской сессии импорта: тир ещё не выбран. Несколько
 // выгрузок за ОДИН месяц (два кабинета) объединяем по МАКСИМУМУ PV на id.
 // Пришёл другой месяц — набор начинаем заново, чтобы не тащить старые баллы.
+// ── канал-приёмник CSV из расширения ───────────────────────────────────────
+export function getImportChannel() { return db().importChannel || null; }
+
+export function setImportChannel(id, title) {
+  const data = db();
+  data.importChannel = { id, title: title || '', at: Date.now() };
+  persist(data);
+  return data.importChannel;
+}
+
 export function ingestInbox(records, meta = {}) {
   const data = db();
   const month = String(meta.month || '').trim();
