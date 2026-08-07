@@ -191,8 +191,7 @@ async function evaluateAndReply(ctx, member) {
 // ─────────────────────────────────────────────────────────────────────────
 function mainMenu() {
   return new InlineKeyboard()
-    .text('📲 Данные из расширения', 'adm_inbox').row()
-    .text('📥 Обновить файлом (CSV)', 'adm_update').row()
+    .text('🔄 Обновить список участников', 'adm_inbox').row()
     .text('📋 Список участников', 'adm_list').row()
     .text('👀 Кто не зарегистрирован', 'adm_unreg').row()
     .text('🔗 Отвязать участника', 'adm_unbind_start').row()
@@ -412,27 +411,6 @@ bot.callbackQuery('adm_backup', async (ctx) => {
   return sendDatabaseBackup(ctx);
 });
 
-// «Обновить подписчиков» → выбор чата (тира)
-bot.callbackQuery('adm_update', async (ctx) => {
-  await ctx.answerCallbackQuery();
-  if (!TIERS.length) return ctx.reply('Чаты не настроены (TIER1_NAME… в .env).', { reply_markup: mainMenu() });
-  const kb = new InlineKeyboard();
-  TIERS.forEach((t) => kb.text(`${t.name} (от ${t.threshold})`, `adm_tier:${t.key}`).row());
-  kb.text('❌ Отмена', 'adm_cancel');
-  await ctx.reply('📋 Какой чат обновляем? У каждого свой порог баллов:', { reply_markup: kb });
-});
-
-bot.callbackQuery(/^adm_tier:(\w+)$/, async (ctx) => {
-  const tier = tierByKey(ctx.match[1]);
-  await ctx.answerCallbackQuery();
-  if (!tier) return ctx.reply('Чат не найден.', { reply_markup: mainMenu() });
-  store.startImport(ctx.from.id, tier.key);
-  await ctx.reply(
-    `📊 Обновляем «${tier.name}» (порог ${tier.threshold} баллов).\n\n📥 Пришли CSV-файл из расширения. Если кабинета два — присылай оба по очереди, потом жми «Посчитать на вылет».`,
-    { reply_markup: new InlineKeyboard().text('✅ Посчитать на вылет', 'adm_calc').text('❌ Отмена', 'adm_cancel') }
-  );
-});
-
 // ── Авто-пуш из расширения: входящие + уведомление ──────────────────────────
 // Кому слать пуш о новых данных: явные ADMIN_IDS + авто-админы. Тех, кто задан
 // только по @username (без user_id), написать нельзя — они увидят данные в меню.
@@ -462,16 +440,20 @@ async function notifyAdminsOfPush(summary) {
 async function showInbox(ctx) {
   const box = store.getInbox();
   if (!box || !box.total) {
-    return ctx.reply('📲 Пока данных из расширения нет.\n\nОткрой в doTERRA «Команда → Структура», нажми «Экспорт» в расширении — данные сами прилетят сюда.', { reply_markup: mainMenu() });
+    return ctx.reply(
+      '📭 Данных пока нет.\n\nОткрой в doTERRA «Команда → Структура» и нажми месяц в расширении — файл сам прилетит сюда. Можно и просто прислать мне CSV сюда в чат.',
+      { reply_markup: mainMenu() }
+    );
   }
   const kb = new InlineKeyboard();
-  TIERS.forEach((t) => kb.text(`Проверить: ${t.name} (от ${t.threshold})`, `adm_pushtier:${t.key}`).row());
+  TIERS.forEach((t) => kb.text(`${t.name} (от ${t.threshold})`, `adm_pushtier:${t.key}`).row());
   kb.text('◀️ Назад', 'adm_back');
   const when = box.receivedAt ? new Date(box.receivedAt).toLocaleString('ru-RU') : '—';
   await ctx.reply(
-    `📲 Данные из расширения${box.month ? ' · ' + escHtml(box.month) : ''}\n` +
-    `👥 Всего: ${box.total} · PV≥50: ${box.ge50 ?? '—'} · выгрузок: ${box.cabinets?.length || 1}\n` +
-    `🕒 Получено: ${when}\n\nВыбери чат для проверки на вылет:`,
+    `🔄 <b>Обновление списка участников</b>\n` +
+    `📅 Данные${box.month ? ' за ' + escHtml(box.month) : ''} · получены ${when}\n` +
+    `👥 В выгрузке: ${box.total} чел. · PV≥50: ${box.ge50 ?? '—'} · выгрузок: ${box.cabinets?.length || 1}\n\n` +
+    `Какой чат пересчитываем? Покажу, кого удалить и кого пригласить:`,
     { parse_mode: 'HTML', reply_markup: kb }
   );
 }
@@ -592,27 +574,15 @@ bot.callbackQuery(/^adm_do_unbind:(\d{6,9})$/, async (ctx) => {
 });
 
 // Приём CSV (только админ; файл качаем токеном этого же бота)
+// Файл, присланный админом руками, попадает в тот же инбокс, что и файл из
+// канала: выбор чата больше не нужен заранее — он спрашивается после разбора.
 bot.on('message:document', async (ctx) => {
   if (!isAdmin(ctx.from)) return;
-  const session = store.getImport();
-  if (!session || !session.tier) { await ctx.reply('Сначала «📥 Обновить подписчиков» и выбери чат.', { reply_markup: mainMenu() }); return; }
-  const tier = tierByKey(session.tier);
   try {
-    const file = await ctx.getFile();
-    const resp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    if (Number(resp.headers.get('content-length') || 0) > 5_000_000) throw new Error('файл слишком большой');
-    const rows = parseCSV(await resp.text());
-    const det = detectColumns(rows);
-    if (det.idIdx < 0 || det.pointsIdx < 0) { await ctx.reply('Не нашёл колонки ID и PV. Это файл от расширения?'); return; }
-    const added = store.addImportFile(ctx.message.document.file_name || 'csv', extractRecords(rows, det.idIdx, det.pointsIdx));
-    const sess = store.getImport();
-    const inTier = store.listMembers().filter((m) => m.tiers?.[session.tier] === 'in');
-    const missing = inTier.filter((m) => !(m.doterraId in sess.points));
-    const warn = missing.length ? `\n⚠️ ${missing.length} из ${inTier.length} в чате нет в файле (возможно, второй кабинет). Пришли второй файл или жми «Посчитать» — их не тронем.` : '';
-    await ctx.reply(`✅ «${tier?.name}»: файл принят — ${added} строк (файлов: ${sess.files.length}).${warn}`, {
-      reply_markup: new InlineKeyboard().text('✅ Посчитать на вылет', 'adm_calc').text('❌ Отмена', 'adm_cancel'),
-    });
+    const doc = ctx.message.document;
+    const records = await downloadCsvRecords(doc);
+    store.ingestInbox(records, { month: monthFromFileName(doc.file_name), cabinet: ctx.message.caption || '' });
+    await showInbox(ctx);
   } catch (e) { await ctx.reply('Ошибка чтения файла: ' + e.message); }
 });
 
@@ -855,6 +825,22 @@ function monthFromFileName(name) {
   return m ? `${m[1]} ${m[2]}` : '';
 }
 
+// Скачать документ и превратить в записи { id, points }. Бросает понятную
+// ошибку — её текст уходит админу как есть.
+async function downloadCsvRecords(doc) {
+  const file = await bot.api.getFile(doc.file_id);
+  if (Number(file.file_size || 0) > 5_000_000) throw new Error('файл слишком большой');
+  const resp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const rows = parseCSV(await resp.text());
+  if (!rows.length) throw new Error('файл пустой — похоже, страница не догрузилась');
+  const det = detectColumns(rows);
+  if (det.idIdx < 0 || det.pointsIdx < 0) throw new Error('не нашёл колонки ID и PV — это файл от расширения?');
+  const records = extractRecords(rows, det.idIdx, det.pointsIdx);
+  if (!records.length) throw new Error('в файле только заголовок, ни одной строки');
+  return records;
+}
+
 bot.on('channel_post', async (ctx) => {
   if (!(await adoptImportChannel(ctx.chat))) return;
   const post = ctx.channelPost;
@@ -863,16 +849,7 @@ bot.on('channel_post', async (ctx) => {
   const doc = post.document || post.reply_to_message?.document;
   if (!doc || seenChannelFiles.has(doc.file_unique_id)) return;
   try {
-    const file = await bot.api.getFile(doc.file_id);
-    if (Number(file.file_size || 0) > 5_000_000) throw new Error('файл слишком большой');
-    const resp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    const rows = parseCSV(await resp.text());
-    if (!rows.length) throw new Error('файл пустой — похоже, страница не догрузилась');
-    const det = detectColumns(rows);
-    if (det.idIdx < 0 || det.pointsIdx < 0) throw new Error('не нашёл колонки ID и PV — это файл от расширения?');
-    const records = extractRecords(rows, det.idIdx, det.pointsIdx);
-    if (!records.length) throw new Error('в файле только заголовок, ни одной строки');
+    const records = await downloadCsvRecords(doc);
     seenChannelFiles.add(doc.file_unique_id);
     const summary = store.ingestInbox(records, { month: monthFromFileName(doc.file_name), cabinet: post.caption || '' });
     await notifyAdminsOfPush(summary);
