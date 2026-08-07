@@ -24,6 +24,7 @@ const DIR = process.env.STORE_DIR || process.env.DATA_DIR || dirname(fileURLToPa
 const FILE = resolve(DIR, 'store.json');
 const TMP = resolve(DIR, 'store.json.tmp');
 const BACKUP_DIR = resolve(DIR, 'backups');
+const LATEST_BACKUP = resolve(BACKUP_DIR, 'latest.json');
 const BACKUP_KEEP = Math.max(3, Number(process.env.BACKUP_KEEP) || 30);
 const BACKUP_INTERVAL_MS = Math.max(1, Number(process.env.BACKUP_INTERVAL_HOURS) || 6) * 60 * 60 * 1000;
 let lastAutomaticBackupAt = 0;
@@ -66,7 +67,11 @@ function db() {
   try {
     return readStore(FILE);
   } catch (error) {
-    for (const backup of backupFiles()) {
+    const recoveryFiles = [
+      ...(existsSync(LATEST_BACKUP) ? [{ name: 'latest.json', path: LATEST_BACKUP }] : []),
+      ...backupFiles(),
+    ];
+    for (const backup of recoveryFiles) {
       try {
         console.error(`store: основной файл повреждён, читаю резервную копию ${backup.name}`);
         return readStore(backup.path);
@@ -74,6 +79,20 @@ function db() {
     }
     console.error('store: база и резервные копии не читаются:', error.message);
     return structuredClone(EMPTY);
+  }
+}
+
+function updateLatestBackup() {
+  if (!existsSync(FILE)) return null;
+  try {
+    mkdirSync(BACKUP_DIR, { recursive: true });
+    const tmp = LATEST_BACKUP + '.tmp';
+    copyFileSync(FILE, tmp);
+    renameSync(tmp, LATEST_BACKUP);
+    return LATEST_BACKUP;
+  } catch (error) {
+    console.error('store latest backup:', error.message);
+    return null;
   }
 }
 
@@ -109,7 +128,15 @@ function persist(data) {
   try { mkdirSync(DIR, { recursive: true }); } catch {}
   writeFileSync(TMP, JSON.stringify(data, null, 2));
   renameSync(TMP, FILE);
+  updateLatestBackup();
   snapshot('auto', false);
+}
+
+// При каждом запуске сразу делаем исторический снимок существующей базы.
+// latest.json затем обновляется после КАЖДОЙ записи, без шестичасовой задержки.
+if (existsSync(FILE)) {
+  updateLatestBackup();
+  snapshot('startup', false);
 }
 
 export function getData() { return db(); }

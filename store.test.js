@@ -20,6 +20,7 @@ test('registrations survive reload and backups recover a damaged store', async (
 
     assert.equal(store.getMember('18170008')?.userId, 123456789);
     assert.ok(existsSync(join(dir, 'store.json')));
+    assert.ok(existsSync(join(dir, 'backups', 'latest.json')));
     assert.ok(readdirSync(join(dir, 'backups')).some((name) => name.endsWith('.json')));
 
     const manual = store.createBackupSnapshot('test');
