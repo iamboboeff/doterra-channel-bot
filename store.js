@@ -335,9 +335,14 @@ export function getPoints(doterraId) {
   return Object.prototype.hasOwnProperty.call(data.points, doterraId) ? data.points[doterraId] : null;
 }
 
+// Отметка о применении нужна, чтобы в «Статусе» было видно, насколько свежие
+// баллы: по старому снимку бот пускал бы людей за прошлый месяц.
+export function getPointsUpdatedAt() { return db().pointsUpdatedAt || null; }
+
 export function commitPoints(pointsMap) {
   const data = db();
   data.points = Object.fromEntries(pointsMap);
+  data.pointsUpdatedAt = new Date().toISOString();
   persist(data);
 }
 

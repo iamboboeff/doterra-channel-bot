@@ -515,13 +515,37 @@ bot.callbackQuery('adm_list', async (ctx) => {
   await ctx.reply(head + body);
 });
 
+const fmtWhen = (iso) => (iso ? new Date(iso).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' }) : null);
+
+// «Статус» — заодно и диагностика: видно, живо ли хранилище между деплоями,
+// насколько свежие баллы и не лежат ли непринятые данные из расширения.
+function statusText(members, perTier) {
+  const info = store.getStorageInfo();
+  const points = Object.keys(store.getData().points || {}).length;
+  const when = fmtWhen(store.getPointsUpdatedAt());
+  const box = store.getInbox();
+
+  const pointsLine = points
+    ? `⭐️ Баллы в базе: ${points} чел.${when ? ` · обновлены ${when}` : ''}`
+    : `⭐️ Баллы в базе: пусто — ни одно обновление ещё не применено`;
+  const inboxLine = box?.total
+    ? `📥 Ждут применения: ${box.total} чел.${box.month ? ` за ${box.month}` : ''} · получены ${fmtWhen(box.receivedAt) || '—'}\n   Нажми «Обновить список участников», чтобы применить.`
+    : `📥 Ждут применения: ничего не пришло`;
+
+  return (
+    `ℹ️ Статус\n\n` +
+    `👥 Зарегистрировано: ${members.length}\n${perTier || '(чаты не настроены)'}\n\n` +
+    `${pointsLine}\n${inboxLine}\n\n` +
+    `💾 Хранилище: ${info.directory}\n` +
+    `   резервных копий: ${info.backups}${info.lastBackupAt ? ` · последняя ${fmtWhen(info.lastBackupAt)}` : ''}`
+  );
+}
+
 bot.callbackQuery('adm_status', async (ctx) => {
   const members = store.listMembers();
   await ctx.answerCallbackQuery();
   const perTier = TIERS.map((t) => `• ${t.name} (от ${t.threshold}): ${members.filter((m) => m.tiers?.[t.key] === 'in').length} в чате`).join('\n');
-  await ctx.reply(
-    `ℹ️ Статус\n\n👥 Зарегистрировано: ${members.length}\n${perTier || '(чаты не настроены)'}\n\n⭐️ Снимок баллов: ${Object.keys(store.getData().points).length} записей.`
-  );
+  await ctx.reply(statusText(members, perTier));
 });
 
 bot.callbackQuery('adm_cancel', async (ctx) => {
