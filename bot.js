@@ -57,8 +57,12 @@ if (!TIERS.length) console.warn('⚠️  Не настроено ни одног
 
 const bot = new Bot(BOT_TOKEN);
 
-const isAdmin = (u) =>
+// isAdminBase — есть ли права в принципе; isAdmin — пользуется ли ими сейчас.
+// Разделены ради /adminoff: он не отбирает права, а лишь прячет панель, поэтому
+// вернуть их через /admin можно всегда, даже когда прав из .env не отнять.
+const isAdminBase = (u) =>
   !!u && (ADMIN_IDS.has(u.id) || (u.username && ADMIN_USERNAMES.has(u.username.toLowerCase())) || store.isStoredAdmin(u));
+const isAdmin = (u) => isAdminBase(u) && !store.isAdminOff(u.id);
 const fmtPv = (pv) => (pv == null ? '—' : pv);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -220,8 +224,24 @@ function applyKeyboard(nRemove, nInvite) {
   if (nInvite) return kb.text(`➕ Пригласить (${nInvite})`, 'adm_inv').row().text('❌ Отмена', 'adm_cancel');
   return kb.text('✅ Обновить баллы', 'adm_inv').row().text('❌ Отмена', 'adm_cancel');
 }
+// Сводка прямо в панели: обычно админ открывает её именно чтобы узнать, есть ли
+// новые данные, — незачем ради этого ходить в «Статус».
+function panelSummary() {
+  const members = store.listMembers();
+  const inChat = members.filter((m) => TIERS.some((t) => m.tiers?.[t.key] === 'in')).length;
+  const box = store.getInbox();
+  const who = members.length ? `${members.length} · в чатах ${inChat}` : 'пока никого';
+  const data = box?.total
+    ? `${box.total} чел.${box.month ? ' за ' + escHtml(box.month) : ''} — ждут применения`
+    : 'новых данных нет';
+  return `👥 Участников: ${who}\n📥 Из расширения: ${data}`;
+}
+
 const showAdminPanel = (ctx) =>
-  ctx.reply('🛠 Админ-панель doTERRA\n\nВыбери действие кнопкой ниже. Другие команды — /help.', { reply_markup: mainMenu() });
+  ctx.reply(
+    `🛠 <b>Админ-панель doTERRA</b>\n\n${panelSummary()}\n\nВыбери действие ↓  ·  ещё команды: /help`,
+    { parse_mode: 'HTML', reply_markup: mainMenu() }
+  );
 
 const phoneConfirmKeyboard = () =>
   new Keyboard().requestContact('📱 Отправить мой номер').resized().oneTime();
@@ -294,7 +314,25 @@ bot.command('start', async (ctx) => {
 
 // /admin — явный вход в панель. Для не-админа работает только как первичная
 // настройка (если админы ещё нигде не заданы), иначе просто отказ.
+// Выключить себе панель: бот начнёт отвечать как обычному участнику. Удобно,
+// чтобы проверить, что видят люди, не заводя второй аккаунт.
+bot.command('adminoff', async (ctx) => {
+  if (!isAdminBase(ctx.from)) return ctx.reply('У тебя и так нет админ-доступа.');
+  if (store.isAdminOff(ctx.from.id)) return ctx.reply('🔒 Админка уже выключена. Включить обратно — /admin');
+  store.setAdminOff(ctx.from.id, true);
+  await ctx.reply(
+    '🔒 <b>Админка выключена</b>\n\nТеперь я отвечаю тебе как обычному участнику — попробуй /start и /check.\n' +
+      'Уведомления о новых данных тоже не приходят.\n\nВключить обратно: /admin',
+    { parse_mode: 'HTML' }
+  );
+});
+
 bot.command('admin', async (ctx) => {
+  if (isAdminBase(ctx.from) && store.isAdminOff(ctx.from.id)) {
+    store.setAdminOff(ctx.from.id, false);
+    await ctx.reply('🔓 Админка включена обратно.');
+    return showAdminPanel(ctx);
+  }
   if (isAdmin(ctx.from)) return showAdminPanel(ctx);
   if (!HAS_EXPLICIT_ADMINS && MAX_AUTO_ADMINS > 0 && store.getAutoAdmins().length < MAX_AUTO_ADMINS) {
     store.addAutoAdmin(ctx.from.id);
@@ -328,7 +366,7 @@ bot.command(['id', 'chatid'], (ctx) => {
 
 bot.command('help', (ctx) => {
   if (isAdmin(ctx.from)) {
-    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /backup — скачать резервную копию базы\n• /addadmin <ID | @username | +телефон> — добавить администратора\n• /admins — показать список администраторов\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
+    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /adminoff — выключить себе админку и побыть обычным участником (обратно — /admin)\n• /backup — скачать резервную копию базы\n• /addadmin <ID | @username | +телефон> — добавить администратора\n• /admins — показать список администраторов\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
   }
   const doors = TIERS.map((t) => `• «${t.name}» — от ${t.threshold} баллов`).join('\n');
   return ctx.reply(
@@ -437,7 +475,7 @@ bot.callbackQuery('adm_backup', async (ctx) => {
 function adminUserIds() {
   const ids = new Set(store.getAdminAccess().ids);
   for (const id of ADMIN_IDS) ids.add(id);
-  return [...ids];
+  return [...ids].filter((id) => !store.isAdminOff(id)); // /adminoff глушит и уведомления
 }
 
 async function notifyAdminsOfPush(summary) {
@@ -501,18 +539,30 @@ bot.callbackQuery('adm_dismiss_push', async (ctx) => {
 bot.callbackQuery('adm_list', async (ctx) => {
   const members = store.listMembers();
   await ctx.answerCallbackQuery();
-  if (!members.length) return ctx.reply('Пока никто не зарегистрирован.');
-  const lines = members.map((m) => {
-    const pv = store.getPoints(m.doterraId);
-    const inT = TIERS.filter((t) => m.tiers?.[t.key] === 'in').map((t) => t.key);
-    const invT = TIERS.filter((t) => m.tiers?.[t.key] === 'invited').map((t) => t.key);
-    const badge = inT.length ? `🟢${inT.join(',')}` : invT.length ? `🟡${invT.join(',')}` : '⚪️';
-    return `${badge} ${m.name || '—'} · ${m.doterraId} · ${fmtPv(pv)}`;
-  });
-  const head = `👥 Участники (${members.length})\n🟢 — в чате · 🟡 — приглашён · ⚪️ — ждёт баллов\n\n`;
-  let body = lines.join('\n');
-  if ((head + body).length > 3800) body = lines.slice(0, 60).join('\n') + `\n… и ещё ${members.length - 60}`;
-  await ctx.reply(head + body);
+  if (!members.length) {
+    return ctx.reply('👥 Участников пока нет.\n\nЛюди появятся здесь, когда напишут боту свой doTERRA ID.', { reply_markup: mainMenu() });
+  }
+  // Группируем по состоянию: плоский список с бейджами читался хуже — глазами
+  // приходилось выискивать, кто из них вообще не дошёл до чата.
+  const groups = { in: [], invited: [], waiting: [] };
+  for (const m of members) {
+    const inT = TIERS.filter((t) => m.tiers?.[t.key] === 'in');
+    const invT = TIERS.filter((t) => m.tiers?.[t.key] === 'invited');
+    const where = inT.length ? ' · ' + inT.map((t) => '№' + t.key).join(',') : invT.length ? ' · ' + invT.map((t) => '№' + t.key).join(',') : '';
+    const row = `${m.name || '—'} · ${m.doterraId} · ${fmtPv(store.getPoints(m.doterraId))} б.${where}`;
+    (inT.length ? groups.in : invT.length ? groups.invited : groups.waiting).push(row);
+  }
+
+  const block = (icon, title, rows) =>
+    rows.length ? `\n${icon} <b>${title} — ${rows.length}</b>\n` + rows.map((r, i) => `${i + 1}. ${escHtml(r)}`).join('\n') + '\n' : '';
+  let text =
+    `👥 <b>Участники — ${members.length}</b>\n` +
+    block('🟢', 'В чатах', groups.in) +
+    block('🟡', 'Приглашены, но не вошли', groups.invited) +
+    block('⚪️', 'Ждут баллов', groups.waiting);
+  if (groups.invited.length) text += `\n💡 Не вошли — ссылка живёт сутки. «Обновить список участников» выдаст им новую.`;
+  if (text.length > 3800) text = text.slice(0, 3800) + '\n…';
+  await ctx.reply(text, { parse_mode: 'HTML', reply_markup: mainMenu() });
 });
 
 const fmtWhen = (iso) => (iso ? new Date(iso).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' }) : null);

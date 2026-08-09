@@ -41,6 +41,7 @@ const EMPTY = {
   adminPhones: [], // phone[] — ожидают подтверждения контактом в Telegram
   seen: {}, // userId -> { userId, name, username, tiers:{tierKey:lastISO} } — кого бот видел в чатах
   importChannel: null, // { id, title, at } — приватный канал, куда расширение постит CSV
+  adminOff: [], // userId[] — админы, временно отключившие себе панель (/adminoff)
 };
 
 function hydrate(raw) {
@@ -232,6 +233,23 @@ export function isStoredAdmin(user) {
   if ((data.admins || []).some((id) => Number(id) === Number(user.id))) return true;
   const username = cleanUsername(user.username);
   return !!username && (data.adminUsernames || []).includes(username);
+}
+
+// Личный выключатель панели: админ остаётся админом в конфиге, но бот общается
+// с ним как с обычным участником. Нужен, чтобы проверить бота глазами человека,
+// и работает поверх любого источника прав — хоть .env, хоть /addadmin.
+export function isAdminOff(userId) {
+  return (db().adminOff || []).some((id) => Number(id) === Number(userId));
+}
+
+export function setAdminOff(userId, off) {
+  const data = db();
+  const list = new Set((data.adminOff || []).map(Number));
+  if (off) list.add(Number(userId));
+  else list.delete(Number(userId));
+  data.adminOff = [...list];
+  persist(data);
+  return off;
 }
 
 export function hasPendingAdminPhones() {
