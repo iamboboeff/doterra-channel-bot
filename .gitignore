@@ -1,6 +1,8 @@
 node_modules/
+cleanup.env
 store.json
 backups/
+cleanup-plans/
 store.json.tmp
 doterra-export-windows*.zip
 *.log

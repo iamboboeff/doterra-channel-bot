@@ -6,10 +6,15 @@
   "type": "module",
   "scripts": {
     "start": "node bot.js",
-    "test": "node --test"
+    "test": "node --test",
+    "cleanup:preview": "node scripts/purge-chat.js",
+    "cleanup:execute": "node scripts/purge-chat.js --execute"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "grammy": "^1.30.0"
+    "grammy": "^1.30.0",
+    "pg": "^8.23.0",
+    "qrcode": "^1.5.4",
+    "teleproto": "^1.228.5"
   }
 }

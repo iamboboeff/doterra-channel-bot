@@ -72,6 +72,9 @@ export function startIngestServer({ port, secret, onPush, log = console.log } = 
       const meta = {
         month: String(payload.month || '').trim(),
         cabinet: String(payload.cabinet || payload.source || '').trim(),
+        team: String(payload.team || payload.group || '').trim(),
+        mode: String(payload.mode || '').trim(),
+        name: String(payload.name || '').trim(),
       };
       const summary = (await onPush?.(rows, meta)) || {};
       res.writeHead(200, { 'Content-Type': 'application/json' });

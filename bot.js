@@ -5,6 +5,16 @@ import { classify } from './logic.js';
 import { parseAdminTarget } from './admin-access.js';
 import * as store from './store.js';
 import { startIngestServer } from './ingest.js';
+import {
+  billingPeriod,
+  formatRub,
+  paymentDeadlinePassed,
+  paymentIsPaid,
+  periodLabel,
+  teamLabel,
+  TEAM_GUEST,
+} from './billing.js';
+import { parseUploadCsvMeta, resolveUploadMeta } from './upload-meta.js';
 
 // ─────────────────────────────────────────────────────────────────────────
 //  ОДИН БОТ НА ВСЁ
@@ -64,6 +74,7 @@ const isAdminBase = (u) =>
   !!u && (ADMIN_IDS.has(u.id) || (u.username && ADMIN_USERNAMES.has(u.username.toLowerCase())) || store.isStoredAdmin(u));
 const isAdmin = (u) => isAdminBase(u) && !store.isAdminOff(u.id);
 const fmtPv = (pv) => (pv == null ? '—' : pv);
+const fmtDate = (iso) => iso ? new Date(iso).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow', dateStyle: 'short', timeStyle: 'short' }) : '—';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── Помощники вывода ────────────────────────────────────────────────────────
@@ -149,17 +160,36 @@ async function syncTierMembership(tier) {
   return { checked, inside };
 }
 
-// По текущим баллам приглашаем участника во все чаты, где он проходит порог и
-// ещё не состоит. Возвращает { links, inNow, lack, soon }.
+function isMemberInside(member) {
+  return TIERS.some((tier) => member?.tiers?.[tier.key] === 'in');
+}
+
+function paymentAccess(member, now = new Date()) {
+  const team = store.getMemberTeam(member.doterraId);
+  if (team !== TEAM_GUEST) return { team, required: false, paid: true, mayInvite: true, inGrace: false, record: null };
+  const period = billingPeriod(now);
+  const record = store.ensurePayment(member.doterraId, period, now);
+  const paid = paymentIsPaid(record);
+  const inGrace = !paid && isMemberInside(member) && !paymentDeadlinePassed(record, now);
+  return { team, period, required: true, paid, mayInvite: paid, inGrace, record };
+}
+
+function paymentClaimKeyboard(period) {
+  return new InlineKeyboard().text('✅ Я оплатил(а)', `pay_claim:${period}`);
+}
+
+// По текущим баллам и оплате приглашаем участника во все доступные чаты.
 async function admit(member) {
   const pv = store.getPoints(member.doterraId);
-  const res = { pv, links: [], inNow: [], lack: [], soon: [] };
+  const payment = paymentAccess(member);
+  const res = { pv, payment, links: [], inNow: [], lack: [], soon: [], paymentBlocked: [] };
   if (pv == null) return res;
   for (const t of TIERS) {
     const fresh = store.getMember(member.doterraId) || member;
     const state = fresh.tiers?.[t.key];
     if (pv >= t.threshold) {
       if (state === 'in') { res.inNow.push(t.name); continue; }
+      if (!payment.mayInvite) { res.paymentBlocked.push(t.name); continue; }
       // Уже в чате (например, вступил до бота)? Пометим 'in' и не шлём лишнюю ссылку.
       if (t.id && isInsideStatus(await chatMemberStatus(t, fresh.userId))) {
         store.setTierState(fresh.doterraId, t.key, 'in'); res.inNow.push(t.name); continue;
@@ -188,10 +218,26 @@ async function evaluateAndReply(ctx, member) {
     return;
   }
   let msg = '';
+  msg += `👥 Команда: ${teamLabel(r.payment.team)}\n`;
   if (r.links.length) msg += `🎉 Доступ открыт! Заходи по ссылке:\n\n${r.links.join('\n')}\n\n⏳ Ссылка личная, работает сутки и только один раз. Не успел — нажми /check, пришлю новую.\n\n`;
   if (r.inNow.length) msg += `✅ Ты уже в: ${r.inNow.join(', ')}.\n`;
   if (r.soon.length) msg += `⏳ Доступ положен, но ${r.soon.join(', ')} ещё настраивается — загляни позже через /check.\n`;
   if (r.lack.length) msg += `📊 У тебя ${r.pv} балл(ов). Пока не хватает:\n• ${r.lack.join('\n• ')}\n\nНаберёшь — нажми /check, и я открою доступ.\n`;
+  if (r.payment.required && !r.payment.paid && (r.paymentBlocked.length || r.inNow.length)) {
+    const settings = store.getPaymentSettings();
+    const state = r.payment.record?.status === 'claimed'
+      ? '🙋 Сообщение об оплате уже отправлено администратору. Ожидай подтверждения.'
+      : paymentDeadlinePassed(r.payment.record)
+        ? '⚠️ Срок оплаты закончился. После подтверждения бот снова откроет доступ.'
+        : `⏳ Подтвердить оплату нужно до ${fmtDate(r.payment.record?.dueAt)}.`;
+    msg += `\n💳 Для команды «Гость» нужна ежемесячная оплата за ${periodLabel(r.payment.period)} — ${formatRub(settings.amountRub)}.\n${state}\n\n${settings.payDetails}`;
+    const keyboard = r.payment.record?.status === 'claimed' ? undefined : paymentClaimKeyboard(r.payment.period);
+    await ctx.reply(msg.trim(), keyboard ? { reply_markup: keyboard } : undefined);
+    return;
+  }
+  if (r.payment.required && !r.payment.paid && r.lack.length) {
+    msg += `\n💳 После набора нужных баллов для команды «Гость» потребуется ежемесячная оплата.`;
+  }
   await ctx.reply((msg || `Твои баллы: ${r.pv}. Доступных чатов пока нет.`).trim());
 }
 
@@ -202,6 +248,7 @@ function mainMenu() {
   return new InlineKeyboard()
     .text('🔄 Обновить список участников', 'adm_inbox').row()
     .text('📋 Список участников', 'adm_list').row()
+    .text('💳 Оплата гостей', 'adm_payments').row()
     .text('👀 Кто не зарегистрирован', 'adm_unreg').row()
     .text('🔗 Отвязать участника', 'adm_unbind_start').row()
     .text('👑 Администраторы', 'adm_admins').row()
@@ -211,8 +258,12 @@ function mainMenu() {
 
 // Кнопки под результатом «Посчитать»: удалить / пригласить / и то и то —
 // показываем только применимые (по числу на вылет и на приглашение).
-function applyKeyboard(nRemove, nInvite) {
+function applyKeyboard(nRemove, nInvite, { allowRemove = true } = {}) {
   const kb = new InlineKeyboard();
+  if (!allowRemove) {
+    if (nInvite) return kb.text(`➕ Пригласить (${nInvite})`, 'adm_inv').row().text('❌ Отмена', 'adm_cancel');
+    return kb.text('✅ Обновить баллы', 'adm_inv').row().text('❌ Отмена', 'adm_cancel');
+  }
   if (nRemove && nInvite) {
     return kb
       .text(`🗑 Только удалить (${nRemove})`, 'adm_del').row()
@@ -230,11 +281,13 @@ function panelSummary() {
   const members = store.listMembers();
   const inChat = members.filter((m) => TIERS.some((t) => m.tiers?.[t.key] === 'in')).length;
   const box = store.getInbox();
+  const period = billingPeriod();
+  const claims = store.listPayments(period).filter((payment) => payment.status === 'claimed').length;
   const who = members.length ? `${members.length} · в чатах ${inChat}` : 'пока никого';
   const data = box?.total
-    ? `${box.total} чел.${box.month ? ' за ' + escHtml(box.month) : ''} — ждут применения`
+    ? `${box.total} чел.${box.month ? ' за ' + escHtml(box.month) : ''} · выгрузок ${box.uploads} — доступны для проверки`
     : 'новых данных нет';
-  return `👥 Участников: ${who}\n📥 Из расширения: ${data}`;
+  return `👥 Участников: ${who}\n📥 Из расширения: ${data}\n💳 Оплаты: ${claims ? `ожидают подтверждения ${claims}` : 'новых заявок нет'}`;
 }
 
 const showAdminPanel = (ctx) =>
@@ -299,7 +352,7 @@ bot.command('start', async (ctx) => {
   const existing = store.findMemberByUser(ctx.from.id);
   if (existing) {
     const pv = store.getPoints(existing.doterraId);
-    await ctx.reply(`✅ Ты уже зарегистрирован.\n\n🆔 doTERRA ID: ${existing.doterraId}\n⭐️ Баллы: ${fmtPv(pv)}\n\nНажми /check — проверю доступ в чаты. Ошибся с ID? Просто пришли правильный.`);
+    await ctx.reply(`✅ Ты уже зарегистрирован.\n\n🆔 doTERRA ID: ${existing.doterraId}\n👥 Команда: ${teamLabel(store.getMemberTeam(existing.doterraId))}\n⭐️ Баллы: ${fmtPv(pv)}\n\nНажми /check — проверю доступ в чаты. Ошибся с ID? Просто пришли правильный.`);
     return;
   }
   store.setFlow(ctx.from.id, 'awaiting_id');
@@ -366,7 +419,7 @@ bot.command(['id', 'chatid'], (ctx) => {
 
 bot.command('help', (ctx) => {
   if (isAdmin(ctx.from)) {
-    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /adminoff — выключить себе админку и побыть обычным участником (обратно — /admin)\n• /backup — скачать резервную копию базы\n• /addadmin <ID | @username | +телефон> — добавить администратора\n• /admins — показать список администраторов\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nОбновление подписчиков и списки — в меню /admin.');
+    return ctx.reply('🛠 Команды администратора:\n\n• /admin — открыть панель\n• /adminoff — выключить себе админку и побыть обычным участником (обратно — /admin)\n• /backup — скачать резервную копию базы\n• /addadmin <ID | @username | +телефон> — добавить администратора\n• /admins — показать список администраторов\n• /rebind <ID> <user_id> — перепривязать doTERRA ID на другой аккаунт\n• /unbind <ID> — снять привязку и убрать из чатов\n• /whoami — узнать свой user_id\n\nВ меню /admin:\n• красные/зелёные обновления и управление 5 выгрузками;\n• «Оплата гостей» — сумма, реквизиты, срок и подтверждения;\n• «Кто не зарегистрирован» — ручной сбор и очистка регистраций.');
   }
   const doors = TIERS.map((t) => `• «${t.name}» — от ${t.threshold} баллов`).join('\n');
   return ctx.reply(
@@ -376,6 +429,7 @@ bot.command('help', (ctx) => {
       `Частые вопросы:\n` +
       `• Ссылка не открылась или истекла? Нажми /check — пришлю новую.\n` +
       `• Баллы набрал, а доступа нет? Список из кабинета обновляют примерно раз в месяц. Нажми /check — если баллы уже видны, открою сразу.\n` +
+      `• Для команды «Гость» дополнительно нужна подтверждённая оплата за текущий месяц.\n` +
       `• Ошибся в ID? Просто пришли правильный номер.`
   );
 });
@@ -478,15 +532,279 @@ function adminUserIds() {
   return [...ids].filter((id) => !store.isAdminOff(id)); // /adminoff глушит и уведомления
 }
 
+function paymentStatusText(record) {
+  if (record?.status === 'paid') {
+    const by = record.confirmedBy?.username ? `@${record.confirmedBy.username}` : record.confirmedBy?.name || 'администратор';
+    return `✅ Подтверждено · ${fmtDate(record.confirmedAt)} · ${escHtml(by)}`;
+  }
+  if (record?.status === 'claimed') return `🙋 Участник сообщил об оплате · ${fmtDate(record.claimedAt)}`;
+  if (record?.status === 'rejected') return `❌ Отклонено · ${fmtDate(record.rejectedAt)}`;
+  return paymentDeadlinePassed(record) ? `🔴 Не оплачено · срок закончился ${fmtDate(record.dueAt)}` : `⏳ Ожидается до ${fmtDate(record?.dueAt)}`;
+}
+
+function paymentAdminText(member, record) {
+  return (
+    `💳 <b>Оплата команды «Гость»</b>\n\n` +
+    `Участник: ${mention(member.userId, member.name)}${member.username ? ` @${escHtml(member.username)}` : ''}\n` +
+    `doTERRA ID: <code>${escHtml(member.doterraId)}</code>\n` +
+    `Период: ${escHtml(periodLabel(record.period))}\n` +
+    `Сумма: ${formatRub(record.amountRub)}\n` +
+    `PV: ${fmtPv(store.getPoints(member.doterraId))}\n\n` +
+    paymentStatusText(record)
+  );
+}
+
+function paymentAdminKeyboard(member, record) {
+  const kb = new InlineKeyboard();
+  if (record.status === 'paid') {
+    return kb.text('↩️ Отменить подтверждение', `adm_paycancel:${member.doterraId}:${record.period}`);
+  }
+  return kb
+    .text('✅ Подтвердить', `adm_payok:${member.doterraId}:${record.period}`)
+    .text('❌ Отклонить', `adm_payno:${member.doterraId}:${record.period}`);
+}
+
+async function refreshPaymentAdminMessages(member, record) {
+  for (const [adminId, messageId] of Object.entries(record.adminMessages || {})) {
+    try {
+      await tgRetry(() => bot.api.editMessageText(
+        Number(adminId),
+        Number(messageId),
+        paymentAdminText(member, record),
+        { parse_mode: 'HTML', reply_markup: paymentAdminKeyboard(member, record) }
+      ));
+    } catch {}
+  }
+}
+
+async function notifyAdminsOfPaymentClaim(member, record) {
+  const ids = adminUserIds();
+  if (!ids.length) {
+    console.log('payment: некому подтвердить оплату (нет ADMIN_IDS/авто-админов).');
+    return;
+  }
+  for (const uid of ids) {
+    try {
+      const sent = await tgRetry(() => bot.api.sendMessage(uid, paymentAdminText(member, record), {
+        parse_mode: 'HTML',
+        reply_markup: paymentAdminKeyboard(member, record),
+      }));
+      store.setPaymentAdminMessage(member.doterraId, record.period, uid, sent.message_id);
+    } catch (e) { console.error('уведомление об оплате', uid, e.message); }
+  }
+}
+
+async function showPaymentsAdmin(ctx) {
+  const settings = store.getPaymentSettings();
+  const period = billingPeriod();
+  const guests = store.listMembers().filter((member) => store.getMemberTeam(member.doterraId) === TEAM_GUEST);
+  const records = guests.map((member) => store.getPayment(member.doterraId, period)).filter(Boolean);
+  const paid = records.filter(paymentIsPaid).length;
+  const claimed = records.filter((record) => record.status === 'claimed').length;
+  const kb = new InlineKeyboard()
+    .text('💰 Изменить сумму', 'adm_payamount').row()
+    .text('🏦 Изменить реквизиты', 'adm_paydetails').row()
+    .text('⏳ Изменить льготный срок', 'adm_paygrace').row()
+    .text(`📋 Оплаты за месяц (${records.length})`, 'adm_paylist').row()
+    .text('◀️ Назад', 'adm_back');
+  await ctx.reply(
+    `💳 <b>Оплата команды «Гость»</b>\n\n` +
+    `Период: ${escHtml(periodLabel(period))}\n` +
+    `Сумма: ${formatRub(settings.amountRub)}\n` +
+    `Льготный срок: ${settings.graceDays} дн.\n` +
+    `Гостей зарегистрировано: ${guests.length}\n` +
+    `Подтверждено: ${paid} · ожидают проверки: ${claimed}\n\n` +
+    `<b>Как оплатить:</b>\n${escHtml(settings.payDetails)}`,
+    { parse_mode: 'HTML', reply_markup: kb }
+  );
+}
+
+async function showPaymentList(ctx) {
+  const period = billingPeriod();
+  const guests = store.listMembers().filter((member) => store.getMemberTeam(member.doterraId) === TEAM_GUEST);
+  const rows = guests.map((member) => ({ member, record: store.ensurePayment(member.doterraId, period) }));
+  const order = { claimed: 0, pending: 1, rejected: 2, paid: 3 };
+  rows.sort((a, b) => (order[a.record.status] ?? 9) - (order[b.record.status] ?? 9) || String(a.member.name || '').localeCompare(String(b.member.name || '')));
+  const lines = rows.slice(0, 40).map(({ member, record }, index) => {
+    const icon = record.status === 'paid' ? '✅' : record.status === 'claimed' ? '🙋' : record.status === 'rejected' ? '❌' : paymentDeadlinePassed(record) ? '🔴' : '⏳';
+    return `${index + 1}. ${icon} ${escHtml(member.name || '—')} · <code>${member.doterraId}</code> · ${formatRub(record.amountRub)}`;
+  });
+  const kb = new InlineKeyboard();
+  rows.filter(({ record }) => record.status === 'claimed').slice(0, 15).forEach(({ member, record }) => {
+    kb.text(`✅ ${member.name || member.doterraId}`, `adm_payok:${member.doterraId}:${record.period}`)
+      .text('❌', `adm_payno:${member.doterraId}:${record.period}`).row();
+  });
+  kb.text('◀️ К оплатам', 'adm_payments');
+  await ctx.reply(
+    `📋 <b>Оплаты · ${escHtml(periodLabel(period))}</b>\n\n${lines.length ? lines.join('\n') : 'Гостей пока нет.'}` +
+    (rows.length > 40 ? `\n… и ещё ${rows.length - 40}` : ''),
+    { parse_mode: 'HTML', reply_markup: kb }
+  );
+}
+
+bot.callbackQuery('adm_payments', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await showPaymentsAdmin(ctx);
+});
+
+bot.callbackQuery('adm_paylist', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await showPaymentList(ctx);
+});
+
+bot.callbackQuery('adm_payamount', async (ctx) => {
+  adminState.set(ctx.from.id, { step: 'await_payment_amount' });
+  await ctx.answerCallbackQuery();
+  await ctx.reply('Введите новую месячную сумму в рублях, только число. Например: 2000', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') });
+});
+
+bot.callbackQuery('adm_paydetails', async (ctx) => {
+  adminState.set(ctx.from.id, { step: 'await_payment_details' });
+  await ctx.answerCallbackQuery();
+  await ctx.reply('Отправьте новый текст с реквизитами и инструкцией по оплате:', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') });
+});
+
+bot.callbackQuery('adm_paygrace', async (ctx) => {
+  adminState.set(ctx.from.id, { step: 'await_payment_grace' });
+  await ctx.answerCallbackQuery();
+  await ctx.reply('Сколько полных дней давать на оплату в начале месяца? От 0 до 31:', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') });
+});
+
+async function handlePaymentDecision(ctx, status) {
+  const id = ctx.match[1];
+  const period = ctx.match[2];
+  const member = store.getMember(id);
+  if (!member) { await ctx.answerCallbackQuery('Участник не найден.'); return; }
+  const record = store.setPaymentStatus(id, period, status, ctx.from);
+  if (!record) { await ctx.answerCallbackQuery('Оплата не найдена.'); return; }
+  await ctx.answerCallbackQuery(status === 'paid' ? 'Оплата подтверждена' : status === 'rejected' ? 'Оплата отклонена' : 'Подтверждение отменено');
+  await refreshPaymentAdminMessages(member, record);
+
+  if (status === 'paid') {
+    let text = `✅ Оплата ${formatRub(record.amountRub)} за ${periodLabel(period)} подтверждена.`;
+    if (period === billingPeriod()) {
+      const access = await admit(member);
+      if (access.links.length) text += `\n\n🎉 Доступ открыт:\n${access.links.join('\n')}\n\nСсылка личная и действует сутки.`;
+      else if (access.lack.length) text += `\n\nОплата учтена. Для доступа ещё не хватает баллов — проверь через /check.`;
+      else text += `\n\nДоступ активен. Проверить состояние можно через /check.`;
+    }
+    try { await bot.api.sendMessage(member.userId, text); } catch {}
+  } else if (status === 'rejected') {
+    try {
+      await bot.api.sendMessage(member.userId, `❌ Оплата за ${periodLabel(period)} не подтверждена. Проверь перевод и нажми «Я оплатил(а)» ещё раз.`, {
+        reply_markup: period === billingPeriod() ? paymentClaimKeyboard(period) : undefined,
+      });
+    } catch {}
+  } else {
+    try { await bot.api.sendMessage(member.userId, `↩️ Подтверждение оплаты за ${periodLabel(period)} отменено администратором.`); } catch {}
+  }
+  await runPaymentSweep();
+}
+
+bot.callbackQuery(/^adm_payok:(\d{6,9}):(\d{4}-\d{2})$/, (ctx) => handlePaymentDecision(ctx, 'paid'));
+bot.callbackQuery(/^adm_payno:(\d{6,9}):(\d{4}-\d{2})$/, (ctx) => handlePaymentDecision(ctx, 'rejected'));
+bot.callbackQuery(/^adm_paycancel:(\d{6,9}):(\d{4}-\d{2})$/, (ctx) => handlePaymentDecision(ctx, 'pending'));
+
+bot.callbackQuery(/^pay_claim:(\d{4}-\d{2})$/, async (ctx) => {
+  const member = store.findMemberByUser(ctx.from.id);
+  const period = ctx.match[1];
+  if (!member || store.getMemberTeam(member.doterraId) !== TEAM_GUEST) {
+    await ctx.answerCallbackQuery({ text: 'Оплата для этого аккаунта не требуется.', show_alert: true });
+    return;
+  }
+  if (period !== billingPeriod()) {
+    await ctx.answerCallbackQuery({ text: 'Эта кнопка относится к прошлому месяцу. Нажми /check.', show_alert: true });
+    return;
+  }
+  const before = store.getPayment(member.doterraId, period);
+  if (paymentIsPaid(before)) {
+    await ctx.answerCallbackQuery('Оплата уже подтверждена.');
+    return;
+  }
+  if (before?.status === 'claimed' && Object.keys(before.adminMessages || {}).length) {
+    await ctx.answerCallbackQuery('Заявка уже отправлена администратору.');
+    return;
+  }
+  const record = store.claimPayment(member.doterraId, period, ctx.from.id);
+  if (!record) { await ctx.answerCallbackQuery('Не удалось создать заявку.'); return; }
+  await ctx.answerCallbackQuery('Передали администратору на проверку.');
+  try { await ctx.editMessageText('Спасибо! Сообщение об оплате отправлено администратору — подтвердим после проверки. ✅'); } catch {}
+  await notifyAdminsOfPaymentClaim(member, record);
+});
+
+let paymentSweepRunning = false;
+async function runPaymentSweep(now = new Date()) {
+  if (paymentSweepRunning) return;
+  paymentSweepRunning = true;
+  try {
+    const period = billingPeriod(now);
+    const settings = store.getPaymentSettings();
+    for (const member of store.listMembers()) {
+      if (store.getMemberTeam(member.doterraId) !== TEAM_GUEST) continue;
+      const record = store.ensurePayment(member.doterraId, period, now);
+      if (!record || paymentIsPaid(record)) continue;
+      const inside = TIERS.filter((tier) => member.tiers?.[tier.key] === 'in');
+      if (!inside.length) continue;
+
+      if (!paymentDeadlinePassed(record, now)) {
+        if (record.status !== 'claimed' && !record.remindedAt) {
+          try {
+            await bot.api.sendMessage(
+              member.userId,
+              `💳 Напоминание об оплате\n\nЗа ${periodLabel(period)} нужно оплатить ${formatRub(record.amountRub)} до ${fmtDate(record.dueAt)}.\n\n${settings.payDetails}`,
+              { reply_markup: paymentClaimKeyboard(period) }
+            );
+            store.markPaymentReminder(member.doterraId, period, now);
+          } catch {}
+        }
+        continue;
+      }
+
+      let removed = 0;
+      for (const tier of inside) {
+        const result = await banFromTier(member.userId, tier);
+        if (result.banned) {
+          store.setTierState(member.doterraId, tier.key, null);
+          removed++;
+        }
+        await sleep(300);
+      }
+      if (removed && !record.removedAt) {
+        store.markPaymentRemoved(member.doterraId, period, now);
+        try {
+          await bot.api.sendMessage(
+            member.userId,
+            `😔 Доступ приостановлен: оплата ${formatRub(record.amountRub)} за ${periodLabel(period)} не подтверждена.\n\nПосле оплаты нажми кнопку — когда администратор подтвердит перевод и баллов будет достаточно, я снова выдам ссылку.`,
+            { reply_markup: paymentClaimKeyboard(period) }
+          );
+        } catch {}
+        await tellAdmins(
+          `🗑 За неоплату удалён участник команды «Гость»: ${mention(member.userId, member.name)} · ID <code>${member.doterraId}</code> · ${periodLabel(period)}.`
+        );
+      }
+    }
+  } catch (e) {
+    console.error('payment sweep:', e.message);
+  } finally {
+    paymentSweepRunning = false;
+  }
+}
+
 async function notifyAdminsOfPush(summary) {
   const kb = new InlineKeyboard();
-  TIERS.forEach((t) => kb.text(`Проверить: ${t.name} (от ${t.threshold})`, `adm_pushtier:${t.key}`).row());
+  TIERS.forEach((t) => kb.text(`Проверить: ${t.name} (от ${t.threshold})`, `adm_pushtier:${summary.uploadId}:${t.key}`).row());
+  kb.text(`📂 Управлять выгрузками (${summary?.uploads || 1})`, 'adm_uploads').row();
   kb.text('🔕 Позже', 'adm_dismiss_push');
+  const mode = summary?.mode === 'closed' ? '🟢 Закрытый месяц · удаление и приглашение' : '🔴 Текущий месяц · только приглашение';
   const text =
     `📲 <b>Пришли данные из расширения</b>\n` +
+    `${mode}\n` +
     (summary?.month ? `📅 ${escHtml(summary.month)}\n` : '') +
-    `👥 Всего: ${summary?.total ?? '?'} · PV≥50: ${summary?.ge50 ?? '?'} · выгрузок в наборе: ${summary?.cabinets ?? 1}\n\n` +
-    `Проверить чат на вылет:`;
+    `👥 Всего: ${summary?.total ?? '?'} · Анджелика: ${summary?.angelika ?? '?'} · Гость: ${summary?.guests ?? '?'}\n` +
+    `⭐️ PV≥50: ${summary?.ge50 ?? '?'} · выгрузок в наборе: ${summary?.batchUploads ?? 1}\n` +
+    (summary?.dropped?.length ? `♻️ Лимит 5: удалена самая старая выгрузка.\n` : '') +
+    `\n` +
+    (summary?.mode === 'closed' ? `Проверить чат на удаление и приглашение:` : `Проверить, кого пригласить:`);
   const ids = adminUserIds();
   if (!ids.length) { console.log('ingest: некому слать пуш (нет ADMIN_IDS/авто-админов).'); return; }
   for (const uid of ids) {
@@ -504,14 +822,22 @@ async function showInbox(ctx) {
     );
   }
   const kb = new InlineKeyboard();
-  TIERS.forEach((t) => kb.text(`${t.name} (от ${t.threshold})`, `adm_pushtier:${t.key}`).row());
+  TIERS.forEach((t) => kb.text(`${t.name} (от ${t.threshold})`, `adm_pushtier:${box.anchorId}:${t.key}`).row());
+  kb.text(`📂 Управлять выгрузками (${box.uploads})`, 'adm_uploads').row();
   kb.text('◀️ Назад', 'adm_back');
   const when = box.receivedAt ? new Date(box.receivedAt).toLocaleString('ru-RU') : '—';
+  const mode = box.mode === 'closed'
+    ? '🟢 Закрытый месяц: можно удалять и приглашать'
+    : '🔴 Текущий месяц: только приглашение, без удаления';
+  const angelika = Object.values(box.teams || {}).filter((team) => team !== TEAM_GUEST).length;
+  const guests = Object.values(box.teams || {}).filter((team) => team === TEAM_GUEST).length;
   await ctx.reply(
     `🔄 <b>Обновление списка участников</b>\n` +
+    `${mode}\n` +
     `📅 Данные${box.month ? ' за ' + escHtml(box.month) : ''} · получены ${when}\n` +
-    `👥 В выгрузке: ${box.total} чел. · PV≥50: ${box.ge50 ?? '—'} · выгрузок: ${box.cabinets?.length || 1}\n\n` +
-    `Какой чат пересчитываем? Покажу, кого удалить и кого пригласить:`,
+    `👥 В выгрузке: ${box.total} чел. · Анджелика: ${angelika} · Гость: ${guests}\n` +
+    `⭐️ PV≥50: ${box.ge50 ?? '—'} · выгрузок в наборе: ${box.batchUploads.length} · всего сохранено: ${box.uploads}/5\n\n` +
+    `Какой чат пересчитываем? ${box.mode === 'closed' ? 'Покажу, кого удалить и кого пригласить' : 'Покажу только, кого пригласить'}:`,
     { parse_mode: 'HTML', reply_markup: kb }
   );
 }
@@ -521,15 +847,69 @@ bot.callbackQuery('adm_inbox', async (ctx) => {
   await showInbox(ctx);
 });
 
-// Проверить выбранный чат по последним данным из расширения (без присланного файла).
-bot.callbackQuery(/^adm_pushtier:(\w+)$/, async (ctx) => {
-  const tier = tierByKey(ctx.match[1]);
+// Проверить выбранный чат по конкретному набору выгрузок.
+bot.callbackQuery(/^adm_pushtier:([^:]+):(\w+)$/, async (ctx) => {
+  const tier = tierByKey(ctx.match[2]);
   await ctx.answerCallbackQuery();
   if (!tier) return ctx.reply('Чат не найден.', { reply_markup: mainMenu() });
-  if (!store.startImportFromInbox(ctx.from.id, tier.key)) {
+  if (!store.startImportFromInbox(ctx.from.id, tier.key, ctx.match[1])) {
     return ctx.reply('Пока нет данных из расширения. Нажми «Экспорт» в расширении doTERRA — они прилетят сюда сами.', { reply_markup: mainMenu() });
   }
   await calcAndShow(ctx);
+});
+
+function uploadModeLabel(mode) { return mode === 'closed' ? '🟢 закрытый' : '🔴 текущий'; }
+
+async function showUploads(ctx) {
+  const uploads = store.listInboxUploads();
+  if (!uploads.length) return ctx.reply('📭 Сохранённых выгрузок нет.', { reply_markup: mainMenu() });
+  const lines = uploads.map((u, i) => {
+    const when = new Date(u.receivedAt).toLocaleString('ru-RU');
+    const label = u.cabinet || u.name || 'без названия';
+    return `${i + 1}. ${uploadModeLabel(u.mode)} · ${escHtml(u.month || 'месяц не указан')}\n   👥 ${teamLabel(u.team)} · ${escHtml(label)} · ${u.count} чел. · ${when}`;
+  });
+  const kb = new InlineKeyboard();
+  uploads.forEach((u, i) => {
+    kb.text(`${u.mode === 'closed' ? '🟢→🔴' : '🔴→🟢'} №${i + 1}`, `adm_uptoggle:${u.id}`)
+      .text(`🗑 №${i + 1}`, `adm_updelask:${u.id}`).row();
+  });
+  kb.text('◀️ К обновлению', 'adm_inbox');
+  await ctx.reply(
+    `📂 <b>Выгрузки — ${uploads.length}/5</b>\n\n${lines.join('\n\n')}\n\n` +
+    `Новая шестая выгрузка автоматически удалит самую старую. Кнопка со стрелкой переключает режим файла.`,
+    { parse_mode: 'HTML', reply_markup: kb }
+  );
+}
+
+bot.callbackQuery('adm_uploads', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await showUploads(ctx);
+});
+
+bot.callbackQuery(/^adm_uptoggle:([^:]+)$/, async (ctx) => {
+  const changed = store.toggleInboxUploadMode(ctx.match[1]);
+  await ctx.answerCallbackQuery(changed ? 'Режим изменён' : 'Выгрузка не найдена');
+  await showUploads(ctx);
+});
+
+bot.callbackQuery(/^adm_updelask:([^:]+)$/, async (ctx) => {
+  const upload = store.listInboxUploads().find((u) => u.id === ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  if (!upload) return ctx.reply('Выгрузка уже удалена.');
+  const label = upload.cabinet || upload.name;
+  await ctx.reply(
+    `Удалить выгрузку «${escHtml(label)}» (${escHtml(upload.month || 'без месяца')})? Итоговый список будет пересчитан по оставшимся файлам.`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: new InlineKeyboard().text('🗑 Да, удалить', `adm_updel:${upload.id}`).row().text('❌ Отмена', 'adm_uploads'),
+    }
+  );
+});
+
+bot.callbackQuery(/^adm_updel:([^:]+)$/, async (ctx) => {
+  const removed = store.removeInboxUpload(ctx.match[1]);
+  await ctx.answerCallbackQuery(removed ? 'Удалено' : 'Уже удалено');
+  await showUploads(ctx);
 });
 
 bot.callbackQuery('adm_dismiss_push', async (ctx) => {
@@ -549,7 +929,10 @@ bot.callbackQuery('adm_list', async (ctx) => {
     const inT = TIERS.filter((t) => m.tiers?.[t.key] === 'in');
     const invT = TIERS.filter((t) => m.tiers?.[t.key] === 'invited');
     const where = inT.length ? ' · ' + inT.map((t) => '№' + t.key).join(',') : invT.length ? ' · ' + invT.map((t) => '№' + t.key).join(',') : '';
-    const row = `${m.name || '—'} · ${m.doterraId} · ${fmtPv(store.getPoints(m.doterraId))} б.${where}`;
+    const team = store.getMemberTeam(m.doterraId);
+    const payment = team === TEAM_GUEST ? store.getPayment(m.doterraId, billingPeriod()) : null;
+    const payMark = team === TEAM_GUEST ? (paymentIsPaid(payment) ? ' · оплата ✅' : payment?.status === 'claimed' ? ' · оплата 🙋' : ' · оплата ⏳') : '';
+    const row = `${m.name || '—'} · ${m.doterraId} · ${fmtPv(store.getPoints(m.doterraId))} б. · ${teamLabel(team)}${payMark}${where}`;
     (inT.length ? groups.in : invT.length ? groups.invited : groups.waiting).push(row);
   }
 
@@ -559,7 +942,7 @@ bot.callbackQuery('adm_list', async (ctx) => {
     `👥 <b>Участники — ${members.length}</b>\n` +
     block('🟢', 'В чатах', groups.in) +
     block('🟡', 'Приглашены, но не вошли', groups.invited) +
-    block('⚪️', 'Ждут баллов', groups.waiting);
+    block('⚪️', 'Ждут выполнения условий', groups.waiting);
   if (groups.invited.length) text += `\n💡 Не вошли — ссылка живёт сутки. «Обновить список участников» выдаст им новую.`;
   if (text.length > 3800) text = text.slice(0, 3800) + '\n…';
   await ctx.reply(text, { parse_mode: 'HTML', reply_markup: mainMenu() });
@@ -574,20 +957,29 @@ function statusText(members, perTier) {
   const points = Object.keys(store.getData().points || {}).length;
   const when = fmtWhen(store.getPointsUpdatedAt());
   const box = store.getInbox();
+  const period = billingPeriod();
+  const guests = members.filter((member) => store.getMemberTeam(member.doterraId) === TEAM_GUEST);
+  const paidGuests = guests.filter((member) => paymentIsPaid(store.getPayment(member.doterraId, period))).length;
+  const claimedPayments = guests.filter((member) => store.getPayment(member.doterraId, period)?.status === 'claimed').length;
 
   const pointsLine = points
     ? `⭐️ Баллы в базе: ${points} чел.${when ? ` · обновлены ${when}` : ''}`
     : `⭐️ Баллы в базе: пусто — ни одно обновление ещё не применено`;
   const inboxLine = box?.total
-    ? `📥 Ждут применения: ${box.total} чел.${box.month ? ` за ${box.month}` : ''} · получены ${fmtWhen(box.receivedAt) || '—'}\n   Нажми «Обновить список участников», чтобы применить.`
-    : `📥 Ждут применения: ничего не пришло`;
+    ? `📥 Последний набор: ${box.total} чел.${box.month ? ` за ${box.month}` : ''} · ${box.mode === 'closed' ? '🟢 закрытый' : '🔴 текущий'} · выгрузок ${box.uploads}/5 · получены ${fmtWhen(box.receivedAt) || '—'}\n   Нажми «Обновить список участников», чтобы проверить или применить.`
+    : `📥 Выгрузки: ничего не пришло`;
+  const postgresLine = info.postgresEnabled
+    ? `🐘 PostgreSQL: ${info.postgresConnected ? `подключена${info.postgresLastSyncedAt ? ` · синхронизация ${fmtWhen(info.postgresLastSyncedAt)}` : ''}` : 'ошибка подключения — используется локальная копия'}`
+    : '🐘 PostgreSQL: не подключена';
 
   return (
     `ℹ️ Статус\n\n` +
-    `👥 Зарегистрировано: ${members.length}\n${perTier || '(чаты не настроены)'}\n\n` +
+    `👥 Зарегистрировано: ${members.length} · Гостей: ${guests.length}\n${perTier || '(чаты не настроены)'}\n` +
+    `💳 ${periodLabel(period)}: оплачено ${paidGuests} · ждут подтверждения ${claimedPayments}\n\n` +
     `${pointsLine}\n${inboxLine}\n\n` +
     `💾 Хранилище: ${info.directory}\n` +
-    `   резервных копий: ${info.backups}${info.lastBackupAt ? ` · последняя ${fmtWhen(info.lastBackupAt)}` : ''}`
+    `   резервных копий: ${info.backups}${info.lastBackupAt ? ` · последняя ${fmtWhen(info.lastBackupAt)}` : ''}\n` +
+    postgresLine
   );
 }
 
@@ -604,46 +996,167 @@ bot.callbackQuery('adm_cancel', async (ctx) => {
   await ctx.reply('Отменено.', { reply_markup: mainMenu() });
 });
 
-// Кто в чатах НЕ зарегистрирован: из тех, кого бот видел (писал/входил) + админы
-// чата. Полного списка участников Telegram боту не даёт — молчунов тут не будет.
+// Полного списка участников Telegram ботам не отдаёт. Мы можем удалить только
+// тех незарегистрированных, чей user_id бот уже видел в сообщении/вступлении.
+// Остальных показываем администратору приблизительным количеством «молчунов».
+async function registrationAudit(tier) {
+  if (!tier?.id) return { total: null, registered: [], knownUnregistered: [], unknown: null, admins: [] };
+  // Не вызываем getChatMember для каждого зарегистрированного: в большом чате
+  // это тысячи запросов. Состояние поддерживается событиями входа/выхода, а
+  // итоговое число неизвестных всё равно является приблизительным.
+  const registered = store.listMembers().filter((m) => m.tiers?.[tier.key] === 'in');
+  const admins = [];
+  const adminIds = new Set();
+  try {
+    for (const a of await bot.api.getChatAdministrators(tier.id)) {
+      const u = a.user;
+      admins.push(u);
+      adminIds.add(u.id);
+    }
+  } catch {}
+
+  const knownUnregistered = [];
+  const seenIds = new Set();
+  for (const s of store.listSeen()) {
+    if (!s.tiers?.[tier.key] || seenIds.has(s.userId)) continue;
+    seenIds.add(s.userId);
+    if (store.findMemberByUser(s.userId) || adminIds.has(s.userId) || isAdminBase({ id: s.userId, username: s.username })) continue;
+    const status = await chatMemberStatus(tier, s.userId);
+    await sleep(40);
+    if (!isInsideStatus(status)) continue;
+    knownUnregistered.push({ userId: s.userId, name: s.name, username: s.username });
+  }
+
+  let total = null;
+  try { total = await bot.api.getChatMemberCount(tier.id); } catch {}
+  const accounted = new Set([
+    ...registered.map((m) => m.userId),
+    ...knownUnregistered.map((p) => p.userId),
+    ...admins.map((u) => u.id),
+  ]);
+  const unknown = total == null ? null : Math.max(0, total - accounted.size);
+  return { total, registered, knownUnregistered, unknown, admins };
+}
+
+function campaignStateText(campaign) {
+  if (!campaign) return 'кампания ещё не запускалась';
+  if (campaign.completedAt) return `завершена ${fmtWhen(campaign.completedAt)}`;
+  return `сбор запущен ${fmtWhen(campaign.startedAt)} · проверка и удаление только вручную`;
+}
+
 bot.callbackQuery('adm_unreg', async (ctx) => {
   await ctx.answerCallbackQuery();
-  const seen = store.listSeen();
-  const htmlBlocks = [], plainBlocks = [];
-  for (const t of TIERS) {
-    if (!t.id) continue;
-    const people = new Map(); // userId -> { userId, name, username, admin }
-    for (const s of seen) {
-      if (!s.tiers?.[t.key]) continue;
-      if (store.findMemberByUser(s.userId)) continue;          // уже привязан
-      if (isAdmin({ id: s.userId, username: s.username })) continue; // управляющий бота
-      people.set(s.userId, { userId: s.userId, name: s.name, username: s.username });
-    }
-    try {
-      for (const a of await bot.api.getChatAdministrators(t.id)) {
-        const u = a.user;
-        if (u.is_bot || people.has(u.id) || store.findMemberByUser(u.id) || isAdmin({ id: u.id, username: u.username })) continue;
-        people.set(u.id, { userId: u.id, name: [u.first_name, u.last_name].filter(Boolean).join(' '), username: u.username, admin: true });
-      }
-    } catch {}
-    let total = null;
-    try { total = await bot.api.getChatMemberCount(t.id); } catch {}
-    const registeredIn = store.listMembers().filter((m) => m.tiers?.[t.key] === 'in').length;
-    const unlinked = total != null ? Math.max(0, total - 1 - registeredIn) : null;
-    const list = [...people.values()];
-    const silent = unlinked != null ? Math.max(0, unlinked - list.length) : null;
-    const countPart = `в чате ${total ?? '?'}` + (unlinked != null ? `, без привязки ~${unlinked}` : '');
-    const seenLine = `👀 Знаю по имени — ${list.length}` + (silent ? ` (ещё ~${silent} молчат, их не видно)` : '') + ':';
-    const htmlList = list.length ? renderPeople(list, (p) => `• ${mention(p.userId, p.name)}${p.username ? ' @' + escHtml(p.username) : ''}${p.admin ? ' (админ чата)' : ''}`) : '—';
-    const plainList = list.length ? renderPeople(list, (p) => `• ${plainName(p)}${p.admin ? ' (админ чата)' : ''}`) : '—';
-    htmlBlocks.push(`«${escHtml(t.name)}» — ${countPart}\n${seenLine}\n${htmlList}`);
-    plainBlocks.push(`«${t.name}» — ${countPart}\n${seenLine}\n${plainList}`);
+  if (!TIERS.some((t) => t.id)) return ctx.reply('Чаты ещё не настроены.', { reply_markup: mainMenu() });
+  await ctx.reply('🔄 Проверяю зарегистрированных и известных участников…');
+  const blocks = [];
+  const kb = new InlineKeyboard();
+  for (const tier of TIERS) {
+    if (!tier.id) continue;
+    const audit = await registrationAudit(tier);
+    const campaign = store.getRegistrationCampaign(tier.key);
+    blocks.push(
+      `«${escHtml(tier.name)}»\n` +
+      `👥 В чате: ${audit.total ?? '?'} · зарегистрировано: ${audit.registered.length}\n` +
+      `👀 Известных незарегистрированных: ${audit.knownUnregistered.length}\n` +
+      `🌫 Молчунов/неизвестных: ~${audit.unknown ?? '?'}\n` +
+      `📅 ${campaignStateText(campaign)}`
+    );
+    if (!campaign || campaign.completedAt) kb.text(`📣 Начать сбор: ${tier.name}`, `adm_regstart:${tier.key}`).row();
+    else kb.text(`👀 Проверить: ${tier.name}`, `adm_regcheck:${tier.key}`).row();
   }
-  const footer = '\n\nℹ️ По именам видны только те, кто писал/входил при боте или админы. Чтобы «вытащить» молчунов — попроси всех что-нибудь написать в чате.';
-  const html = (htmlBlocks.join('\n\n') || 'Чаты не настроены.') + footer;
-  const plain = (plainBlocks.join('\n\n') || 'Чаты не настроены.') + footer;
-  try { await ctx.reply(html, { parse_mode: 'HTML', reply_markup: mainMenu() }); }
-  catch (e) { console.error('adm_unreg', e.message); await ctx.reply(plain.slice(0, 4000), { reply_markup: mainMenu() }); }
+  kb.text('◀️ Назад', 'adm_back');
+  await ctx.reply(
+    `👀 <b>Регистрация участников</b>\n\n${blocks.join('\n\n')}\n\n` +
+    `Бот удаляет только известных ему незарегистрированных. Примерное число молчунов остаётся для ручной проверки. Автоматического удаления по сроку нет.`,
+    { parse_mode: 'HTML', reply_markup: kb }
+  );
+});
+
+bot.callbackQuery(/^adm_regstart:(\w+)$/, async (ctx) => {
+  const tier = tierByKey(ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  if (!tier?.id) return ctx.reply('Чат не настроен.');
+  const existing = store.getRegistrationCampaign(tier.key);
+  if (existing && !existing.completedAt) return ctx.reply(`Кампания уже идёт: ${campaignStateText(existing)}.`);
+  const me = await bot.api.getMe();
+  const link = `https://t.me/${me.username}?start=register`;
+  try {
+    await bot.api.sendMessage(
+      tier.id,
+      `📣 <b>Регистрация участников чата</b>\n\nЗарегистрируйтесь в боте и отправьте свой doTERRA ID. Зарегистрированные участники сохранят доступ к чату. Срок завершения администратор определит вручную.`,
+      { parse_mode: 'HTML', reply_markup: new InlineKeyboard().url('✅ Зарегистрироваться', link) }
+    );
+  } catch (e) {
+    return ctx.reply(`Не удалось опубликовать объявление в «${tier.name}»: ${e.message}`);
+  }
+  const campaign = store.startRegistrationCampaign(tier.key);
+  await ctx.reply(
+    `✅ Сбор регистраций в «${tier.name}» запущен ${fmtWhen(campaign.startedAt)}.\n\nКогда решишь, открой «Кто не зарегистрирован» и вручную запусти проверку и удаление.`,
+    { reply_markup: mainMenu() }
+  );
+});
+
+bot.callbackQuery(/^adm_regcheck:(\w+)$/, async (ctx) => {
+  const tier = tierByKey(ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  if (!tier?.id) return ctx.reply('Чат не настроен.');
+  await ctx.reply('🔄 Проверяю участников…');
+  const audit = await registrationAudit(tier);
+  const campaign = store.getRegistrationCampaign(tier.key);
+  const ready = campaign && !campaign.completedAt;
+  const list = audit.knownUnregistered.length
+    ? renderPeople(audit.knownUnregistered, (p) => `• ${mention(p.userId, p.name)}${p.username ? ' @' + escHtml(p.username) : ''}`)
+    : '—';
+  const kb = new InlineKeyboard();
+  if (ready && audit.knownUnregistered.length) kb.text(`🗑 Удалить известных (${audit.knownUnregistered.length})`, `adm_regconfirm:${tier.key}`).row();
+  if (ready && !audit.knownUnregistered.length) kb.text('✅ Завершить кампанию', `adm_regfinish:${tier.key}`).row();
+  kb.text('◀️ К регистрации', 'adm_unreg');
+  await ctx.reply(
+    `👀 <b>${escHtml(tier.name)}</b>\n\n` +
+    `Зарегистрировано: ${audit.registered.length}\n` +
+    `Известных незарегистрированных: ${audit.knownUnregistered.length}\n` +
+    `Молчунов/неизвестных: ~${audit.unknown ?? '?'}\n` +
+    `Состояние: ${campaignStateText(campaign)}\n\n` +
+    `Кого бот знает и сможет удалить:\n${list}\n\n` +
+    (ready ? `Удаление выполнится только после кнопки ниже.` : `Сначала запусти сбор регистраций.`),
+    { parse_mode: 'HTML', reply_markup: kb }
+  );
+});
+
+bot.callbackQuery(/^adm_regfinish:(\w+)$/, async (ctx) => {
+  const tier = tierByKey(ctx.match[1]);
+  const campaign = tier && store.getRegistrationCampaign(tier.key);
+  if (!campaign || campaign.completedAt) {
+    await ctx.answerCallbackQuery('Активного сбора регистраций нет.');
+    return;
+  }
+  store.finishRegistrationCampaign(tier.key);
+  await ctx.answerCallbackQuery('Кампания завершена');
+  await ctx.reply('✅ Кампания регистрации завершена без автоматического удаления.', { reply_markup: mainMenu() });
+});
+
+bot.callbackQuery(/^adm_regconfirm:(\w+)$/, async (ctx) => {
+  const tier = tierByKey(ctx.match[1]);
+  const campaign = tier && store.getRegistrationCampaign(tier.key);
+  if (!tier?.id || !campaign || campaign.completedAt) {
+    await ctx.answerCallbackQuery('Активного сбора регистраций нет.');
+    return;
+  }
+  await ctx.answerCallbackQuery();
+  const audit = await registrationAudit(tier);
+  await ctx.reply(`⏳ Удаляю известных незарегистрированных: ${audit.knownUnregistered.length}…`);
+  let removed = 0;
+  for (const person of audit.knownUnregistered) {
+    if (store.findMemberByUser(person.userId)) continue; // мог зарегистрироваться прямо сейчас
+    const { banned } = await banFromTier(person.userId, tier);
+    if (banned) removed++;
+    await sleep(300);
+  }
+  store.finishRegistrationCampaign(tier.key);
+  await ctx.reply(
+    `✅ Кампания завершена.\n\nУдалено известных незарегистрированных: ${removed}.\nНеизвестных молчунов осталось примерно: ${audit.unknown ?? '?' } — их нужно проверить вручную.`,
+    { reply_markup: mainMenu() }
+  );
 });
 
 // ── Отвязка участника кнопкой ──
@@ -674,8 +1187,17 @@ bot.on('message:document', async (ctx) => {
   if (!isAdmin(ctx.from)) return;
   try {
     const doc = ctx.message.document;
-    const records = await downloadCsvRecords(doc);
-    store.ingestInbox(records, { month: monthFromFileName(doc.file_name), cabinet: ctx.message.caption || '' });
+    const { records, csvMeta } = await downloadCsvRecords(doc);
+    const uploadMeta = resolveUploadMeta(ctx.message.caption, csvMeta);
+    const summary = store.ingestInbox(records, {
+      month: monthFromFileName(doc.file_name),
+      mode: modeFromFileName(doc.file_name),
+      team: uploadMeta.team,
+      cabinet: uploadMeta.cabinet,
+      name: doc.file_name || 'ручная выгрузка.csv',
+      source: 'manual',
+    });
+    if (summary.dropped.length) await ctx.reply('♻️ Достигнут лимит 5 выгрузок — самая старая удалена автоматически.');
     await showInbox(ctx);
   } catch (e) { await ctx.reply('Ошибка чтения файла: ' + e.message); }
 });
@@ -698,16 +1220,29 @@ async function calcAndShow(ctx) {
   }
 
   const pointsMap = new Map(Object.entries(session.points));
+  const teamsMap = session.teams || {};
   const inTier = store.listMembers().filter((m) => m.tiers?.[session.tier] === 'in');
-  const { toRemove, missing } = classify(inTier, pointsMap, tier.threshold);
-  store.setReviewed(toRemove.map((m) => ({ doterraId: m.doterraId, userId: m.userId, pv: m.pv })));
+  const { toRemove: lowPv, missing } = classify(inTier, pointsMap, tier.threshold);
+  const canRemove = session.mode === 'closed';
+  const removeLow = canRemove ? lowPv : [];
+  const removeMissing = canRemove ? missing : [];
+  const reviewed = [
+    ...removeLow.map((m) => ({ doterraId: m.doterraId, userId: m.userId, pv: m.pv, reason: 'low' })),
+    ...removeMissing.map((m) => ({ doterraId: m.doterraId, userId: m.userId, pv: null, reason: 'missing' })),
+  ];
+  store.setReviewed(reviewed);
 
   // Кого пригласим: привязанные, кто набрал порог и ещё не в чате/не приглашён.
-  const toInvite = store.listMembers().filter((m) => {
+  const inviteCandidates = store.listMembers().filter((m) => {
     if (m.tiers?.[tier.key]) return false;
     const pv = pointsMap.get(m.doterraId);
     return !!tier.id && pv != null && pv >= tier.threshold;
   });
+  const toInvite = inviteCandidates.filter((member) => {
+    const team = teamsMap[member.doterraId] || store.getMemberTeam(member.doterraId);
+    return team !== TEAM_GUEST || paymentIsPaid(store.getPayment(member.doterraId, billingPeriod()));
+  });
+  const waitingPayment = inviteCandidates.filter((member) => !toInvite.includes(member));
   const inviteHtml = toInvite.length
     ? `\n\n➕ <b>Пригласим</b> (набрали ${tier.threshold}+) — ${toInvite.length}:\n` +
       renderPeople(toInvite, (m, i) => `${i + 1}. ${mention(m.userId, m.name)}${m.username ? ' @' + escHtml(m.username) : ''} · ${pointsMap.get(m.doterraId)} б.`)
@@ -715,23 +1250,39 @@ async function calcAndShow(ctx) {
   const invitePlain = toInvite.length
     ? `\n\n➕ Пригласим — ${toInvite.length}:\n` + renderPeople(toInvite, (m, i) => `${i + 1}. ${plainName(m)} · ${pointsMap.get(m.doterraId)} б.`)
     : '';
+  const payHtml = waitingPayment.length
+    ? `\n\n💳 <b>Баллов хватает, ждём оплату — ${waitingPayment.length}</b>:\n` +
+      renderPeople(waitingPayment, (m, i) => `${i + 1}. ${mention(m.userId, m.name)}${m.username ? ' @' + escHtml(m.username) : ''} · ${pointsMap.get(m.doterraId)} б.`)
+    : '';
+  const payPlain = waitingPayment.length
+    ? `\n\n💳 Баллов хватает, ждём оплату — ${waitingPayment.length}:\n` + renderPeople(waitingPayment, (m, i) => `${i + 1}. ${plainName(m)} · ${pointsMap.get(m.doterraId)} б.`)
+    : '';
 
-  const kb = applyKeyboard(toRemove.length, toInvite.length);
-
-  if (!toRemove.length) {
-    const body = inTier.length === 0
-      ? `«${escHtml(tier.name)}»: под удаление никто не попал — в чате нет ни одного привязанного участника.`
-      : `«${escHtml(tier.name)}»: удалять некого — все привязанные в чате набрали ${tier.threshold}+.`;
-    const tail = missing.length ? `\n(${missing.length} без данных — не тронуты.)` : '';
-    try { await ctx.reply(note + body + tail + inviteHtml, { parse_mode: 'HTML', reply_markup: kb }); }
-    catch (e) { console.error('adm_calc', e.message); await ctx.reply((note + body + tail + invitePlain).slice(0, 4000), { reply_markup: kb }); }
-    return;
-  }
-  const missTail = missing.length ? `\n\n⚠️ Без данных, не тронем: ${missing.length}` : '';
-  const listHtml = renderPeople(toRemove, (m, i) => `${i + 1}. ${mention(m.userId, m.name)}${m.username ? ' @' + escHtml(m.username) : ''} · ${m.pv} б.`);
-  const listPlain = renderPeople(toRemove, (m, i) => `${i + 1}. ${plainName(m)} · ${m.pv} б.`);
-  const html = note + `❌ <b>На вылет</b> из «${escHtml(tier.name)}» — ${toRemove.length} (баллов &lt; ${tier.threshold}):\n${listHtml}` + missTail + inviteHtml + `\n\nВыбери действие:`;
-  const plain = note + `❌ На вылет из «${tier.name}» — ${toRemove.length} (баллов < ${tier.threshold}):\n${listPlain}` + missTail + invitePlain + `\n\nВыбери действие:`;
+  const kb = applyKeyboard(reviewed.length, toInvite.length, { allowRemove: canRemove });
+  const modeHead = canRemove
+    ? `🟢 <b>Закрытый месяц${session.month ? ' · ' + escHtml(session.month) : ''}</b> — удаление доступно`
+    : `🔴 <b>Текущий месяц${session.month ? ' · ' + escHtml(session.month) : ''}</b> — никого не удаляем`;
+  const modePlain = canRemove
+    ? `🟢 Закрытый месяц${session.month ? ' · ' + session.month : ''} — удаление доступно`
+    : `🔴 Текущий месяц${session.month ? ' · ' + session.month : ''} — никого не удаляем`;
+  const lowHtml = removeLow.length
+    ? `\n\n❌ <b>Ниже ${tier.threshold} баллов — ${removeLow.length}</b>:\n` +
+      renderPeople(removeLow, (m, i) => `${i + 1}. ${mention(m.userId, m.name)}${m.username ? ' @' + escHtml(m.username) : ''} · ${m.pv} б.`)
+    : '';
+  const lowPlain = removeLow.length
+    ? `\n\n❌ Ниже ${tier.threshold} баллов — ${removeLow.length}:\n` + renderPeople(removeLow, (m, i) => `${i + 1}. ${plainName(m)} · ${m.pv} б.`)
+    : '';
+  const missingHtml = removeMissing.length
+    ? `\n\n📭 <b>Нет ни в одной полной выгрузке — ${removeMissing.length}</b>:\n` +
+      renderPeople(removeMissing, (m, i) => `${i + 1}. ${mention(m.userId, m.name)}${m.username ? ' @' + escHtml(m.username) : ''} · ID ${escHtml(m.doterraId)}`)
+    : (!canRemove && missing.length ? `\n\nℹ️ Нет в промежуточном файле: ${missing.length} — они не затрагиваются.` : '');
+  const missingPlain = removeMissing.length
+    ? `\n\n📭 Нет ни в одной полной выгрузке — ${removeMissing.length}:\n` + renderPeople(removeMissing, (m, i) => `${i + 1}. ${plainName(m)} · ID ${m.doterraId}`)
+    : (!canRemove && missing.length ? `\n\nℹ️ Нет в промежуточном файле: ${missing.length} — они не затрагиваются.` : '');
+  const noChangesHtml = !reviewed.length && !toInvite.length && !waitingPayment.length ? `\n\n✅ Изменений для «${escHtml(tier.name)}» нет.` : '';
+  const noChangesPlain = !reviewed.length && !toInvite.length && !waitingPayment.length ? `\n\n✅ Изменений для «${tier.name}» нет.` : '';
+  const html = note + modeHead + noChangesHtml + lowHtml + missingHtml + inviteHtml + payHtml + `\n\nВыбери действие:`;
+  const plain = note + modePlain + noChangesPlain + lowPlain + missingPlain + invitePlain + payPlain + `\n\nВыбери действие:`;
   try { await ctx.reply(html, { parse_mode: 'HTML', reply_markup: kb }); }
   catch (e) { console.error('adm_calc', e.message); await ctx.reply(plain.slice(0, 4000), { reply_markup: kb }); }
 }
@@ -745,6 +1296,10 @@ async function reinviteTier(pointsMap, tier) {
     if (state === 'in') continue;
     const pv = pointsMap.get(m.doterraId);
     if (pv == null || pv < tier.threshold || !tier.id) continue;
+    if (store.getMemberTeam(m.doterraId) === TEAM_GUEST) {
+      const payment = store.ensurePayment(m.doterraId, billingPeriod());
+      if (!paymentIsPaid(payment)) continue;
+    }
     // Помечен «приглашён», но в чате его нет — ссылка живёт сутки и могла
     // протухнуть. Раньше такие выпадали навсегда: массовая рассылка их
     // пропускала, и вытащить себя человек мог только сам через /check.
@@ -772,29 +1327,39 @@ async function applyImport(ctx, { remove, invite }) {
   const session = store.getImport();
   const tier = tierByKey(session?.tier);
   if (!session || !session.files.length || !tier) { await ctx.answerCallbackQuery('Нет данных.'); return ctx.reply('Нет активного импорта.', { reply_markup: mainMenu() }); }
+  if (remove && session.mode !== 'closed') { await ctx.answerCallbackQuery('В текущем месяце удаление запрещено.'); return; }
   if (remove && !session.reviewed) { await ctx.answerCallbackQuery('Сначала «Посчитать».'); return ctx.reply('Сначала «Посчитать на вылет», потом удаляй.', { reply_markup: mainMenu() }); }
   if (applying) { await ctx.answerCallbackQuery('Уже выполняется, подожди…'); return; }
   applying = true; await ctx.answerCallbackQuery();
   try {
     const pointsMap = new Map(Object.entries(session.points));
-    if (pointsMap.size) store.commitPoints(pointsMap);
+    if (pointsMap.size) store.commitPoints(pointsMap, {
+      replace: session.mode === 'closed',
+      month: session.month || '',
+      teamsMap: new Map(Object.entries(session.teams || {})),
+    });
     let removed = 0, skipped = 0;
     if (remove) {
       await ctx.reply(`⏳ «${tier.name}»: удаляю до ${session.reviewed.length}…`);
       for (const r of session.reviewed) {
         const m = store.getMember(r.doterraId);
         const pv = pointsMap.has(r.doterraId) ? pointsMap.get(r.doterraId) : null;
-        if (!m || m.tiers?.[tier.key] !== 'in' || pv == null || !(pv < tier.threshold)) { skipped++; continue; }
+        const stillEligible = r.reason === 'missing' ? !pointsMap.has(r.doterraId) : pv != null && pv < tier.threshold;
+        if (!m || m.tiers?.[tier.key] !== 'in' || !stillEligible) { skipped++; continue; }
         const { banned } = await banFromTier(m.userId, tier);
         if (banned) {
           store.setTierState(m.doterraId, tier.key, null);
           removed++;
-          try { await bot.api.sendMessage(m.userId, `😔 Доступ в «${tier.name}» приостановлен.\n\nУ тебя ${pv}, а нужно ${tier.threshold} баллов. Наберёшь — нажми /check, и я снова открою.`); } catch {}
+          const why = r.reason === 'missing'
+            ? `Твоего ID нет в полной выгрузке за ${session.month || 'закрытый месяц'}.`
+            : `У тебя ${pv}, а нужно ${tier.threshold} баллов.`;
+          try { await bot.api.sendMessage(m.userId, `😔 Доступ в «${tier.name}» приостановлен.\n\n${why} Если данные обновятся — нажми /check.`); } catch {}
         }
         await sleep(350);
       }
     }
     const invited = invite ? await reinviteTier(pointsMap, tier) : 0;
+    await runPaymentSweep();
     store.clearImport();
     let msg = `✅ Готово по «${tier.name}»:`;
     if (remove) msg += `\n🗑 Удалено: ${removed}` + (skipped ? ` (пропущено ${skipped})` : '');
@@ -831,8 +1396,42 @@ bot.on('message:contact', async (ctx) => {
 
 bot.on('message:text', async (ctx) => {
   if (ctx.chat?.type !== 'private') return; // регистрация/отвязка — только в личке, не в группах
-  // 1) Админ вводит ID для отвязки — этот шаг в приоритете.
   const st = adminState.get(ctx.from.id);
+  if (isAdmin(ctx.from) && st?.step === 'await_payment_amount') {
+    const amountRub = Number(ctx.message.text.replace(/[\s₽руб.]/gi, ''));
+    if (!Number.isSafeInteger(amountRub) || amountRub < 1 || amountRub > 10_000_000) {
+      await ctx.reply('Нужна сумма от 1 до 10 000 000 рублей, только число. Например: 2000');
+      return;
+    }
+    adminState.delete(ctx.from.id);
+    store.updatePaymentSettings({ amountRub });
+    await ctx.reply(`✅ Месячная сумма изменена: ${formatRub(amountRub)}. Уже подтверждённые месяцы не изменятся.`, { reply_markup: mainMenu() });
+    return;
+  }
+  if (isAdmin(ctx.from) && st?.step === 'await_payment_details') {
+    const payDetails = ctx.message.text.trim();
+    if (!payDetails || payDetails.length > 1200) {
+      await ctx.reply('Текст должен быть от 1 до 1200 символов. Отправьте более короткий вариант.');
+      return;
+    }
+    adminState.delete(ctx.from.id);
+    store.updatePaymentSettings({ payDetails });
+    await ctx.reply('✅ Реквизиты и инструкция обновлены.', { reply_markup: mainMenu() });
+    return;
+  }
+  if (isAdmin(ctx.from) && st?.step === 'await_payment_grace') {
+    const graceDays = Number(ctx.message.text.trim());
+    if (!Number.isSafeInteger(graceDays) || graceDays < 0 || graceDays > 31) {
+      await ctx.reply('Введите целое число дней от 0 до 31.');
+      return;
+    }
+    adminState.delete(ctx.from.id);
+    store.updatePaymentSettings({ graceDays });
+    await ctx.reply(`✅ Льготный срок для новых месяцев: ${graceDays} дн. Уже созданные сроки не изменятся.`, { reply_markup: mainMenu() });
+    return;
+  }
+
+  // Админ вводит ID для отвязки — этот шаг в приоритете.
   if (isAdmin(ctx.from) && st?.step === 'await_unbind_id') {
     const id = ctx.message.text.trim();
     if (!/^\d{6,9}$/.test(id)) { await ctx.reply('Нужен номер ID (6–9 цифр). Или «Назад».', { reply_markup: new InlineKeyboard().text('◀️ Назад', 'adm_back') }); return; }
@@ -930,12 +1529,39 @@ function monthFromFileName(name) {
   return m ? `${m[1]} ${m[2]}` : '';
 }
 
-// Скачать документ и превратить в записи { id, points }. Бросает понятную
+// Новое расширение помечает выгрузки в имени файла. Старые/переименованные
+// файлы считаем красными: безопаснее разрешить только приглашение, чем случайно
+// открыть массовое удаление. В «Управлении выгрузками» режим можно переключить.
+function modeFromFileName(name) {
+  const value = String(name || '').toLowerCase();
+  return /(?:^|[-_])(closed|green|full)(?:[-_.]|$)/.test(value) ? 'closed' : 'current';
+}
+
+// Скачать документ и превратить в записи { id, points }. Заодно читаем
+// дублирующие метки «Команда»/«Кабинет», если это файл нового расширения. Бросает понятную
 // ошибку — её текст уходит админу как есть.
 async function downloadCsvRecords(doc) {
-  const file = await bot.api.getFile(doc.file_id);
+  const file = await tgRetry(() => bot.api.getFile(doc.file_id));
   if (Number(file.file_size || 0) > 5_000_000) throw new Error('файл слишком большой');
-  const resp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+  let resp = null;
+  let lastError = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      resp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`, {
+        signal: AbortSignal.timeout(20_000),
+      });
+      break;
+    } catch (e) {
+      lastError = e;
+      const cause = e?.cause?.code || e?.cause?.message || e?.message;
+      console.error(`скачивание CSV: попытка ${attempt}/4:`, cause);
+      if (attempt < 4) await sleep(500 * attempt);
+    }
+  }
+  if (!resp) {
+    const cause = lastError?.cause?.code || lastError?.cause?.message || lastError?.message || 'сетевая ошибка';
+    throw new Error(`не удалось скачать файл после 4 попыток (${cause})`);
+  }
   if (!resp.ok) throw new Error('HTTP ' + resp.status);
   const rows = parseCSV(await resp.text());
   if (!rows.length) throw new Error('файл пустой — похоже, страница не догрузилась');
@@ -943,7 +1569,7 @@ async function downloadCsvRecords(doc) {
   if (det.idIdx < 0 || det.pointsIdx < 0) throw new Error('не нашёл колонки ID и PV — это файл от расширения?');
   const records = extractRecords(rows, det.idIdx, det.pointsIdx);
   if (!records.length) throw new Error('в файле только заголовок, ни одной строки');
-  return records;
+  return { records, csvMeta: parseUploadCsvMeta(rows) };
 }
 
 bot.on('channel_post', async (ctx) => {
@@ -954,9 +1580,17 @@ bot.on('channel_post', async (ctx) => {
   const doc = post.document || post.reply_to_message?.document;
   if (!doc || seenChannelFiles.has(doc.file_unique_id)) return;
   try {
-    const records = await downloadCsvRecords(doc);
+    const { records, csvMeta } = await downloadCsvRecords(doc);
     seenChannelFiles.add(doc.file_unique_id);
-    const summary = store.ingestInbox(records, { month: monthFromFileName(doc.file_name), cabinet: post.caption || '' });
+    const uploadMeta = resolveUploadMeta(post.caption, csvMeta);
+    const summary = store.ingestInbox(records, {
+      month: monthFromFileName(doc.file_name),
+      mode: modeFromFileName(doc.file_name),
+      team: uploadMeta.team,
+      cabinet: uploadMeta.cabinet,
+      name: doc.file_name || 'выгрузка из канала.csv',
+      source: 'channel',
+    });
     await notifyAdminsOfPush(summary);
   } catch (e) {
     console.error('канал:', e.message);
@@ -972,15 +1606,33 @@ startIngestServer({
   port: Number(process.env.PORT || process.env.INGEST_PORT || 0),
   secret: process.env.INGEST_SECRET || '',
   onPush: async (rows, meta) => {
-    const summary = store.ingestInbox(rows, meta);
+    const summary = store.ingestInbox(rows, { ...meta, source: 'http', name: meta.name || 'HTTP-выгрузка.csv' });
     await notifyAdminsOfPush(summary);
     return summary;
   },
 });
 
 bot.catch((err) => console.error('bot:', err.error?.message || err.message));
+let paymentSweepTimer = null;
 bot.start({
   // channel_post — файлы из расширения через канал-приёмник.
   allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member', 'channel_post'],
-  onStart: () => console.log('✓ Бот запущен (участники + админка в одном)'),
+  onStart: () => {
+    console.log('✓ Бот запущен (участники + админка в одном)');
+    setTimeout(() => runPaymentSweep(), 2_000);
+    paymentSweepTimer = setInterval(() => runPaymentSweep(), 30 * 60 * 1000);
+  },
 });
+
+let stopping = false;
+async function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  console.log(`Остановка (${signal}): сохраняю данные…`);
+  if (paymentSweepTimer) clearInterval(paymentSweepTimer);
+  try { await bot.stop(); } catch {}
+  try { await store.closeStorage(); } catch (error) { console.error('storage close:', error.message); }
+}
+
+process.once('SIGINT', () => void shutdown('SIGINT'));
+process.once('SIGTERM', () => void shutdown('SIGTERM'));
