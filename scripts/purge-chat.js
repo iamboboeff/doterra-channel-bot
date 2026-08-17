@@ -72,15 +72,23 @@ async function signInUserByQr(client, apiId, apiHash) {
       { apiId, apiHash },
       {
       qrCode: async ({ token }) => {
-        const uri = `tg://login?token=${token.toString('base64url')}`;
+        // Buffer.from is intentional: some MTProto forks expose a Uint8Array at
+        // runtime even though their TypeScript declarations say Buffer. Calling
+        // Uint8Array#toString would produce comma-separated bytes and Telegram
+        // would report an invalid QR code.
+        const encodedToken = Buffer.from(token).toString('base64url');
+        if (!/^[A-Za-z0-9_-]+$/.test(encodedToken)) throw new Error('Telegram вернул некорректный QR-токен.');
+        const uri = `tg://login?token=${encodedToken}`;
         await QRCode.toFile(qrPath, uri, { width: 520, margin: 2, errorCorrectionLevel: 'M' });
         chmodSync(qrPath, 0o600);
+        const ttl = Math.max(0, Number(expires) - Math.floor(Date.now() / 1000));
         if (!announced) {
           console.log(`\nQR для входа готов: ${qrPath}`);
           console.log('Telegram на телефоне → Настройки → Устройства → Подключить устройство.');
+          console.log(`QR действует около ${ttl || 30} секунд.`);
           announced = true;
         } else {
-          console.log('QR обновлён (прежний истёк).');
+          console.log(`QR обновлён (действует около ${ttl || 30} секунд).`);
         }
       },
       password: async () => {
